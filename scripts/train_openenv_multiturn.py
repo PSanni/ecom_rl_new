@@ -19,10 +19,10 @@ Example:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -47,54 +47,32 @@ logger = logging.getLogger("ecomrlve.train_openenv_multiturn")
 
 
 SYSTEM_PROMPT = """\
-You are a helpful e-commerce shopping assistant. Use the available tools to
-complete the customer's task, then call finish when the task is complete.
+You are a helpful e-commerce shopping assistant. Your goal is to help \
+customers find products, manage orders, handle returns, and answer \
+policy questions.
 
-Important:
-- You must eventually call finish. Do not stop after only calling a search,
-  lookup, cart, order, return, or policy tool.
-- After a tool returns results, continue reasoning from those results and either
-  call another tool or call finish with the final answer.
-- Use only product IDs, variant IDs, order IDs, and line IDs that came from tools.
-- Never show internal IDs in user-facing text unless the user explicitly asks.
-- For cart tasks, use user_get_visit_history first when the user refers to items
-  they viewed or previously selected.
-- For product discovery and substitution tasks, retrieve products before
-  recommending them. Then call finish with recommended_product_ids_json set to a
-  JSON list of product IDs from the tool results, for example:
-  finish("I found two matching options.", "[\"B001\", \"B002\"]")
-- Only call catalog_rerank with product IDs returned by catalog_search. If
-  search returns no products, search again with broader query/filters instead
-  of reranking an empty list.
-- For returns and order status, inspect orders before selecting an order/line.
-- For policy questions, search policy before answering.
+You can use the following tools:
+- catalog.search(query, filters, top_k): Search the product catalog
+- catalog.rerank(query, candidate_product_ids, top_k): Re-rank products
+- catalog.get_product(product_id): Get full product details
+- catalog.get_variants(product_id): Get product variants
+- cart.add(product_id, variant_id, qty): Add item to cart
+- cart.remove(line_id): Remove item from cart
+- cart.view(): View current cart
+- order.list(days): List recent orders
+- order.get_status(order_id): Get order status
+- order.checkout(shipping_address_id, payment_method_id): Checkout
+- return.initiate(order_id, line_id, reason): Initiate a return
+- policy.search(query, top_k): Search policy knowledge base
 
-Available tools include:
-- user_get_visit_history()
-- catalog_search(query, cat, price_max, color, brand, filters_json, top_k)
-- catalog_rerank(query, candidate_product_ids_json, top_k)
-- catalog_get_product(product_id)
-- catalog_get_variants(product_id)
-- cart_add(product_id, variant_id, quantity)
-- cart_remove(line_id)
-- cart_set_quantity(line_id, quantity)
-- cart_view()
-- order_list(days)
-- order_get_status(order_id)
-- order_checkout(shipping_address_id, payment_method_id)
-- return_check_eligibility(order_id, line_id)
-- return_initiate(order_id, line_id, reason_code, method)
-- return_exchange(order_id, line_id, new_product_id, new_variant_id)
-- policy_search(query, top_k)
-- datetime_now()
-- finish(assistant_message, recommended_product_ids_json, selected_order_id,
-         selected_line_id, policy_answer)
+In this tool-calling interface, use the available Python tool names that
+correspond to the tool names above, for example catalog_search for
+catalog.search, catalog_rerank for catalog.rerank, cart_add for cart.add, and
+policy_search for policy.search.
 
-Examples:
-- Product discovery: catalog_search("orange STEM toy", "toys/educational/stem", 93.07, "orange", "", "", 5) -> finish("I found a matching product.", "[\"product_id_from_search\"]")
-- Cart: user_get_visit_history() -> cart_add("product_id_from_history", null, 1) -> finish("Added it to your cart.", "[]")
-- Return: order_list(...) -> return_initiate(...) -> finish("Your return has been started.", "[]", "order_id", "line_id")
-- Policy: policy_search(...) -> finish("The policy says ...", "[]", "", "", "final policy answer")
+When you have found the answer, call finish with the final user-facing message
+and answer fields. For product recommendations, pass recommended_product_ids_json
+as a JSON list of product IDs returned by tools.
 """
 
 
@@ -117,80 +95,6 @@ def _json_loads_or_default(value: str | None, default: Any) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return default
-
-
-def _price_from_query(query: str) -> float | None:
-    match = re.search(r"\$\s*([0-9]+(?:\.[0-9]+)?)", query)
-    if match is None:
-        return None
-    return float(match.group(1))
-
-
-def _normalize_catalog_filters(
-    query: str,
-    filters_json: str,
-    cat: str,
-    price_max: float | int | str | None,
-    color: str,
-    brand: str,
-) -> dict[str, Any] | None:
-    """Translate model-friendly search args to the catalog tool's filter schema."""
-    raw_filters = _json_loads_or_default(filters_json, {})
-    filters = raw_filters if isinstance(raw_filters, dict) else {}
-
-    normalized: dict[str, Any] = {}
-
-    raw_cat = cat or filters.get("cat") or filters.get("category")
-    if isinstance(raw_cat, str) and raw_cat:
-        # The underlying catalog expects exact slash-path categories. Short
-        # labels like "toys" are better left to the semantic query than forced
-        # into an exact metadata filter that would remove all deeper categories.
-        if "/" in raw_cat:
-            normalized["cat"] = raw_cat
-
-    raw_price_max = price_max
-    if raw_price_max in (None, ""):
-        raw_price_max = filters.get("price_max")
-    if raw_price_max in (None, "") and isinstance(filters.get("price"), dict):
-        price_filter = filters["price"]
-        raw_price_max = (
-            price_filter.get("$lt")
-            or price_filter.get("$lte")
-            or price_filter.get("lt")
-            or price_filter.get("lte")
-        )
-    if raw_price_max not in (None, ""):
-        try:
-            parsed_price_max = float(raw_price_max)
-            query_price = _price_from_query(query)
-            if query_price is not None and parsed_price_max > query_price * 10:
-                parsed_price_max = query_price
-            normalized["price_max"] = parsed_price_max
-        except (TypeError, ValueError):
-            pass
-
-    for key, explicit in (("color", color), ("brand", brand)):
-        raw_value = explicit or filters.get(key)
-        if isinstance(raw_value, str) and raw_value:
-            normalized[key] = raw_value
-
-    for key in (
-        "price_min",
-        "rating_min",
-        "rating_max",
-        "ship_days_max",
-        "size",
-        "material",
-        "connector_type",
-        "item_form",
-        "skin_type",
-        "finish_type",
-        "store",
-    ):
-        if key in filters and key not in normalized:
-            normalized[key] = filters[key]
-
-    return normalized or None
 
 
 def _trim_result(result: Any, limit: int = 6000) -> str:
@@ -288,6 +192,61 @@ class EcomRLVEMultiTurnEnv:
         )
         return _trim_result(entry)
 
+    def _execute_catalog_search(
+        self,
+        query: str,
+        filters: dict[str, Any] | None,
+        top_k: int,
+    ) -> str:
+        """Run catalog.search with enough retrieval depth for post-filtering."""
+        if self.done:
+            raise ValueError("Episode is already done.")
+        state = self.env.get_episode_state()
+        if state is None:
+            raise ValueError("Environment has not been reset.")
+
+        requested_top_k = max(1, int(top_k))
+        internal_top_k = max(requested_top_k, 200 if filters else requested_top_k)
+        seen_before = set(state.seen_product_ids)
+        result = self.env._tool_registry.execute(
+            ToolCall(
+                name="catalog.search",
+                args={"query": query, "filters": filters, "top_k": internal_top_k},
+            ),
+            state=state,
+        )
+        returned = result.result if isinstance(result.result, list) else result.result
+        if isinstance(returned, list):
+            returned = returned[:requested_top_k]
+            state.seen_product_ids = seen_before
+            self.env._extract_seen_ids(returned, state.seen_product_ids)
+
+        entry = {
+            "name": "catalog.search",
+            "args": {"query": query, "filters": filters, "top_k": requested_top_k},
+            "result": returned,
+            "error": result.error,
+            "duration_ms": result.duration_ms,
+        }
+        if internal_top_k != requested_top_k:
+            entry["internal_top_k"] = internal_top_k
+            entry["message"] = (
+                "Used a larger internal retrieval pool before applying filters; "
+                "showing only the requested top_k results."
+            )
+        state.tool_results_history.append(entry)
+        if result.error is not None:
+            self.invalid_tool = True
+        result_preview = _trim_result(entry, limit=int(_FACTORY_CONFIG["debug_result_chars"]))
+        self._debug(
+            "tool=%s args=%s error=%s result=%s",
+            "catalog.search",
+            json.dumps(entry["args"], default=str),
+            result.error,
+            result_preview,
+        )
+        return _trim_result(entry)
+
     def _record_tool_observation(
         self,
         name: str,
@@ -327,39 +286,21 @@ class EcomRLVEMultiTurnEnv:
     def catalog_search(
         self,
         query: str,
-        cat: str = "",
-        price_max: float | int | str | None = None,
-        color: str = "",
-        brand: str = "",
-        filters_json: str = "",
+        filters: dict[str, Any] | None = None,
         top_k: int = 10,
     ) -> str:
         """Search the product catalog.
 
         Args:
             query: Natural-language search query.
-            cat: Optional exact slash-path category, e.g. toys/educational/stem.
-            price_max: Optional maximum product price in dollars.
-            color: Optional exact color filter.
-            brand: Optional exact brand filter.
-            filters_json: Optional extra JSON filters using catalog keys.
+            filters: Optional metadata filters using catalog keys, e.g.
+                {"cat": "toys/educational/stem", "price_max": 93.07, "color": "orange"}.
             top_k: Number of results to return.
 
         Returns:
             Matching products.
         """
-        filters = _normalize_catalog_filters(
-            query=query,
-            filters_json=filters_json,
-            cat=cat,
-            price_max=price_max,
-            color=color,
-            brand=brand,
-        )
-        return self._execute_tool(
-            "catalog.search",
-            {"query": query, "filters": filters, "top_k": top_k},
-        )
+        return self._execute_catalog_search(query=query, filters=filters, top_k=top_k)
 
     def catalog_rerank(
         self,
@@ -754,7 +695,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.6,
+        help="Sampling temperature. Default 0.6 matches Qwen3 thinking-mode guidance.",
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=0.95,
+        help="Nucleus sampling top_p. Default 0.95 matches Qwen3 thinking-mode guidance.",
+    )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=20,
+        help="Top-k sampling. Default 20 matches Qwen3 guidance.",
+    )
+    parser.add_argument(
+        "--min_p",
+        type=float,
+        default=0.0,
+        help="Minimum probability sampling cutoff. Default 0.0 matches Qwen3 guidance.",
+    )
     parser.add_argument("--max_seq_length", type=int, default=4096)
     parser.add_argument("--max_completion_length", type=int, default=4096)
     parser.add_argument("--lora_rank", type=int, default=16)
@@ -782,7 +746,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disable_thinking",
         action="store_true",
-        help="Pass enable_thinking=False through GRPO chat template kwargs",
+        help=(
+            "Pass enable_thinking=False through GRPO chat template kwargs. "
+            "By default thinking mode is explicitly left enabled."
+        ),
     )
     parser.add_argument(
         "--debug_rollouts",
@@ -884,8 +851,37 @@ def main() -> None:
     from trl import GRPOConfig, GRPOTrainer
 
     config_kwargs: dict[str, Any] = {}
-    if args.disable_thinking:
-        config_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+    grpo_config_params = inspect.signature(GRPOConfig).parameters
+    requested_generation_kwargs: dict[str, Any] = {
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
+    }
+    for key, value in requested_generation_kwargs.items():
+        if key in grpo_config_params:
+            config_kwargs[key] = value
+        else:
+            logger.warning(
+                "Installed TRL GRPOConfig does not support %s; leaving it at TRL/model default.",
+                key,
+            )
+
+    thinking_enabled = not args.disable_thinking
+    if "chat_template_kwargs" in grpo_config_params:
+        config_kwargs["chat_template_kwargs"] = {"enable_thinking": thinking_enabled}
+    elif args.disable_thinking:
+        logger.warning(
+            "Installed TRL GRPOConfig does not support chat_template_kwargs; "
+            "cannot pass enable_thinking=False."
+        )
+    logger.info(
+        "Generation: temperature=%s top_p=%s top_k=%s min_p=%s thinking=%s",
+        args.temperature,
+        args.top_p,
+        args.top_k,
+        args.min_p,
+        "enabled" if thinking_enabled else "disabled",
+    )
 
     per_device_train_batch_size = max(args.batch_size, args.num_generations)
     if per_device_train_batch_size != args.batch_size:
