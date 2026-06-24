@@ -583,10 +583,19 @@ def main() -> None:
     from unsloth import FastLanguageModel
 
     load_in_4bit = args.load_in_4bit and not args.load_in_16bit
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    model_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    logger.info(
+        "Precision: model dtype=%s, trainer bf16=%s, trainer fp16=%s",
+        model_dtype,
+        use_bf16,
+        not use_bf16,
+    )
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model,
         max_seq_length=args.max_seq_length,
+        dtype=model_dtype,
         load_in_4bit=load_in_4bit,
         fast_inference=True,       # Enable vLLM fast inference for GRPO
         max_lora_rank=args.lora_rank,
@@ -684,8 +693,8 @@ def main() -> None:
 
         # Misc
         seed=args.seed,
-        bf16=torch.cuda.is_bf16_supported(),
-        fp16=not torch.cuda.is_bf16_supported(),
+        bf16=use_bf16,
+        fp16=not use_bf16,
     )
 
     # ------------------------------------------------------------------
