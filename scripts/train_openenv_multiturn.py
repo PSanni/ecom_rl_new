@@ -556,6 +556,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--load_in_4bit", action="store_true", default=True)
     parser.add_argument("--load_in_16bit", action="store_true", default=False)
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default="fp16",
+        choices=["fp16", "bf16"],
+        help="Training precision for the native TRL path (default: fp16)",
+    )
     parser.add_argument("--output_dir", type=str, default="outputs/ecomrlve_multiturn")
     parser.add_argument("--save_steps", type=int, default=50)
     parser.add_argument(
@@ -589,11 +596,9 @@ def main() -> None:
     })
 
     load_in_4bit = args.load_in_4bit and not args.load_in_16bit
-    use_bf16 = (
-        torch.cuda.is_available()
-        and torch.cuda.is_bf16_supported()
-        and not load_in_4bit
-    )
+    use_bf16 = args.precision == "bf16"
+    if use_bf16 and not torch.cuda.is_bf16_supported():
+        raise ValueError("--precision bf16 requested, but this CUDA device does not support bf16.")
     model_dtype = torch.bfloat16 if use_bf16 else torch.float16
 
     logger.info("Loading model: %s", args.model)
@@ -682,6 +687,7 @@ def main() -> None:
         seed=args.seed,
         bf16=use_bf16,
         fp16=not use_bf16,
+        remove_unused_columns=False,
         **config_kwargs,
     )
 
