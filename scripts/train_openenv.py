@@ -531,7 +531,7 @@ def parse_args() -> argparse.Namespace:
         help="Save checkpoint every N steps (default: 50)",
     )
     parser.add_argument(
-        "--report_to", type=str, default="none",
+        "--report_to", type=str, default="tensorboard",
         choices=["none", "wandb", "tensorboard", "trackio"],
         help="Experiment tracker (default: none)",
     )
@@ -603,7 +603,7 @@ def main() -> None:
         max_seq_length=args.max_seq_length,
         dtype=model_dtype,
         load_in_4bit=load_in_4bit,
-        fast_inference=True,       # Enable vLLM fast inference for GRPO
+        fast_inference=False,       # Enable vLLM fast inference for GRPO
         max_lora_rank=args.lora_rank,
         gpu_memory_utilization=0.6,  # Reduce if OOM
     )
