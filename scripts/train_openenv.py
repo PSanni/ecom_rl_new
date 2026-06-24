@@ -517,8 +517,8 @@ def parse_args() -> argparse.Namespace:
         help="Max prompt length in tokens (auto-detected if None)",
     )
     parser.add_argument(
-        "--max_completion_length", type=int, default=512,
-        help="Max completion length in tokens (default: 512)",
+        "--max_completion_length", type=int, default=2048,
+        help="Max completion length in tokens (default: 2048)",
     )
 
     # Output
