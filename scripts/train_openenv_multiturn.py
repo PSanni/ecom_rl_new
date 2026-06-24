@@ -483,8 +483,17 @@ class EcomRLVEMultiTurnEnv:
         )
 
 
-def reward_func(environments: list[EcomRLVEMultiTurnEnv], **_: Any) -> list[float]:
+def reward_func(
+    environments: list[EcomRLVEMultiTurnEnv] | None = None,
+    **_: Any,
+) -> list[float]:
     """Read final rewards from environment instances after each rollout."""
+    if environments is None:
+        raise RuntimeError(
+            "TRL did not pass environments to reward_func. This script requires "
+            "a GRPOTrainer version with environment_factory support and must not "
+            "use the Unsloth-patched single-turn GRPOTrainer."
+        )
     rewards = []
     for env in environments:
         env.ensure_finished()
@@ -579,8 +588,6 @@ def main() -> None:
         "env_id": args.env_id,
     })
 
-    from unsloth import FastLanguageModel
-
     load_in_4bit = args.load_in_4bit and not args.load_in_16bit
     use_bf16 = (
         torch.cuda.is_available()
@@ -593,25 +600,50 @@ def main() -> None:
     logger.info("Collection=%s env_id=%s", args.collection, args.env_id or "<cycle>")
     logger.info("Precision: dtype=%s load_in_4bit=%s", model_dtype, load_in_4bit)
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.model,
-        max_seq_length=args.max_seq_length,
-        dtype=model_dtype,
-        load_in_4bit=load_in_4bit,
-        fast_inference=False,
-        max_lora_rank=args.lora_rank,
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    quantization_config = None
+    if load_in_4bit:
+        from transformers import BitsAndBytesConfig
+
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=model_dtype,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        torch_dtype=model_dtype if not load_in_4bit else None,
+        quantization_config=quantization_config,
+        device_map="auto",
+        trust_remote_code=True,
     )
-    model = FastLanguageModel.get_peft_model(
-        model,
+    model.config.use_cache = False
+
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+    if load_in_4bit:
+        model = prepare_model_for_kbit_training(model)
+
+    lora_config = LoraConfig(
+        task_type="CAUSAL_LM",
         r=args.lora_rank,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
         lora_alpha=args.lora_rank * 2,
-        use_gradient_checkpointing="unsloth",
-        random_state=args.seed,
+        lora_dropout=0.0,
+        bias="none",
     )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
 
     dataset = build_dataset(args.n_prompts, args.collection, args.env_id)
     logger.info("Built %d prompt rows", len(dataset))
