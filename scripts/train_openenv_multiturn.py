@@ -88,7 +88,10 @@ _FACTORY_CONFIG: dict[str, Any] = {
     "env_id": None,
     "difficulty": None,
     "config": {"disclose_env_id": True, "disclose_difficulty": True},
+    "debug_rollouts": 0,
+    "debug_result_chars": 1200,
 }
+_DEBUG_ROLLOUT_COUNT = 0
 
 
 def _json_loads_or_default(value: str | None, default: Any) -> Any:
@@ -117,6 +120,7 @@ class EcomRLVEMultiTurnEnv:
     """
 
     def __init__(self) -> None:
+        global _DEBUG_ROLLOUT_COUNT
         self.env = EcomRLVEEnv(
             collection=_FACTORY_CONFIG["collection"],
             seed=int(_FACTORY_CONFIG["seed"]),
@@ -127,6 +131,13 @@ class EcomRLVEMultiTurnEnv:
         self.env_id = ""
         self.episode_seed = 0
         self.invalid_tool = False
+        self.debug_enabled = _DEBUG_ROLLOUT_COUNT < int(_FACTORY_CONFIG["debug_rollouts"])
+        self.debug_id = _DEBUG_ROLLOUT_COUNT
+        _DEBUG_ROLLOUT_COUNT += 1
+
+    def _debug(self, message: str, *args: Any) -> None:
+        if self.debug_enabled:
+            logger.info("[rollout:%03d] " + message, self.debug_id, *args)
 
     def reset(self, **kwargs: Any) -> str:
         """Start a fresh EcomRLVE episode and return the first user message."""
@@ -146,6 +157,12 @@ class EcomRLVEMultiTurnEnv:
         self.episode_seed = state.seed if state is not None else int(seed or 0)
 
         user_message = obs.conversation[0]["content"] if obs.conversation else ""
+        self._debug(
+            "reset env=%s seed=%s user=%s",
+            self.env_id,
+            self.episode_seed,
+            user_message[:300],
+        )
         task_bits = [f"Task env: {self.env_id}"]
         if obs.difficulty is not None:
             task_bits.append(f"Difficulty: {obs.difficulty}")
@@ -171,6 +188,14 @@ class EcomRLVEMultiTurnEnv:
             self.invalid_tool = True
         else:
             self.env._extract_seen_ids(result.result, state.seen_product_ids)
+        result_preview = _trim_result(entry, limit=int(_FACTORY_CONFIG["debug_result_chars"]))
+        self._debug(
+            "tool=%s args=%s error=%s result=%s",
+            name,
+            json.dumps(args, default=str),
+            result.error,
+            result_preview,
+        )
         return _trim_result(entry)
 
     def user_get_visit_history(self) -> str:
@@ -465,18 +490,32 @@ class EcomRLVEMultiTurnEnv:
         _obs, reward, done, info = self.env.step(json.dumps(action))
         self.done = done
         self.reward = -1.0 if self.invalid_tool else float(reward)
-        return _trim_result({
+        summary = {
             "reward": self.reward,
             "done": self.done,
             "is_correct": info.get("is_correct", False),
             "termination_reason": info.get("termination_reason"),
             "reward_breakdown": info.get("reward_breakdown", {}),
-        })
+        }
+        self._debug(
+            "finish message=%s answer=%s summary=%s",
+            assistant_message[:300],
+            json.dumps(answer, default=str),
+            _trim_result(summary, limit=int(_FACTORY_CONFIG["debug_result_chars"])),
+        )
+        return _trim_result(summary)
 
     def ensure_finished(self) -> None:
         """Force terminal scoring if the rollout stopped before finish."""
         if self.done:
             return
+        state = self.env.get_episode_state()
+        tool_history = state.tool_results_history if state is not None else []
+        self._debug(
+            "fallback_finish invalid_tool=%s tool_history=%s",
+            self.invalid_tool,
+            _trim_result(tool_history, limit=int(_FACTORY_CONFIG["debug_result_chars"])),
+        )
         self.finish(
             assistant_message="I have completed the task.",
             recommended_product_ids_json="[]",
@@ -498,6 +537,11 @@ def reward_func(
     for env in environments:
         env.ensure_finished()
         rewards.append(float(env.reward))
+    if any(env.debug_enabled for env in environments):
+        logger.info(
+            "[reward_func] rewards=%s",
+            json.dumps([round(float(r), 4) for r in rewards]),
+        )
     return rewards
 
 
@@ -581,6 +625,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Pass enable_thinking=False through GRPO chat template kwargs",
     )
+    parser.add_argument(
+        "--debug_rollouts",
+        type=int,
+        default=0,
+        help="Log internal env/tool/reward details for the first N rollout env instances.",
+    )
+    parser.add_argument(
+        "--debug_result_chars",
+        type=int,
+        default=1200,
+        help="Maximum characters per debug tool result/reward payload.",
+    )
     return parser.parse_args()
 
 
@@ -597,6 +653,8 @@ def main() -> None:
         "collection": args.collection,
         "seed": args.seed,
         "env_id": args.env_id,
+        "debug_rollouts": args.debug_rollouts,
+        "debug_result_chars": args.debug_result_chars,
     })
 
     load_in_4bit = args.load_in_4bit and not args.load_in_16bit
