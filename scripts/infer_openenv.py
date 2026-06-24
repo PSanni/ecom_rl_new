@@ -120,6 +120,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip environment scoring and only print generation",
     )
+    parser.add_argument(
+        "--max_turns",
+        type=int,
+        default=6,
+        help="Maximum interactive tool-use turns for scored inference",
+    )
     return parser.parse_args()
 
 
@@ -140,6 +146,35 @@ def render_prompt(
     except TypeError:
         kwargs.pop("enable_thinking", None)
         return tokenizer.apply_chat_template(messages, **kwargs)
+
+
+def format_tool_results(tool_results: list[dict[str, Any]]) -> str:
+    return "Tool results:\n" + json.dumps(tool_results, indent=2, default=str)
+
+
+def generate_completion(
+    model: Any,
+    tokenizer: Any,
+    messages: list[dict[str, str]],
+    args: argparse.Namespace,
+    device: str,
+) -> tuple[str, int]:
+    prompt = render_prompt(tokenizer, messages, args.disable_thinking)
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+    with torch.inference_mode():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            do_sample=args.temperature > 0,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    new_tokens = output_ids[0, inputs["input_ids"].shape[-1]:]
+    completion = tokenizer.decode(new_tokens, skip_special_tokens=False)
+    return completion, int(inputs["input_ids"].shape[-1])
 
 
 def main() -> None:
@@ -176,78 +211,130 @@ def main() -> None:
     FastLanguageModel.for_inference(model)
 
     openenv = EcomRLVEOpenEnv(collection=args.collection, seed=args.seed)
-    if args.env_id:
-        if args.env_id not in openenv.env_ids:
-            raise ValueError(
-                f"env_id '{args.env_id}' is not in collection {args.collection}: "
-                f"{openenv.env_ids}"
-            )
-        env_id = args.env_id
-        episode_seed = args.seed
-        obs = openenv.env.reset(env_id=env_id, seed=episode_seed)
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages.extend({"role": m["role"], "content": m["content"]} for m in obs.conversation)
-    else:
-        messages, env_id, episode_seed = openenv.sample_prompt(tokenizer)
-
-    prompt = render_prompt(tokenizer, messages, args.disable_thinking)
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-
-    logger.info("Collection=%s env=%s seed=%s", args.collection, env_id, episode_seed)
-    logger.info("Prompt tokens=%d", int(inputs["input_ids"].shape[-1]))
-
-    with torch.inference_mode():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            do_sample=args.temperature > 0,
-            pad_token_id=tokenizer.eos_token_id,
+    if args.env_id and args.env_id not in openenv.env_ids:
+        raise ValueError(
+            f"env_id '{args.env_id}' is not in collection {args.collection}: "
+            f"{openenv.env_ids}"
         )
 
-    new_tokens = output_ids[0, inputs["input_ids"].shape[-1]:]
-    completion = tokenizer.decode(new_tokens, skip_special_tokens=False)
+    if args.no_score:
+        if args.env_id:
+            env_id = args.env_id
+            episode_seed = args.seed
+            obs = openenv.env.reset(env_id=env_id, seed=episode_seed)
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            messages.extend({"role": m["role"], "content": m["content"]} for m in obs.conversation)
+        else:
+            messages, env_id, episode_seed = openenv.sample_prompt(tokenizer)
 
-    print("\n" + "=" * 80)
-    print("PROMPT")
-    print("=" * 80)
-    for message in messages:
-        print(f"[{message['role']}]\n{message['content']}\n")
+        completion, prompt_tokens = generate_completion(model, tokenizer, messages, args, device)
+        logger.info("Collection=%s env=%s seed=%s", args.collection, env_id, episode_seed)
+        logger.info("Prompt tokens=%d", prompt_tokens)
 
-    print("=" * 80)
-    print("COMPLETION")
-    print("=" * 80)
-    print(completion)
+        print("\n" + "=" * 80)
+        print("PROMPT")
+        print("=" * 80)
+        for message in messages:
+            print(f"[{message['role']}]\n{message['content']}\n")
 
-    extracted = _extract_json_from_completion(completion)
-    print("\n" + "=" * 80)
-    print("EXTRACTED JSON")
-    print("=" * 80)
-    if extracted is None:
-        print("<none>")
-    else:
+        print("=" * 80)
+        print("COMPLETION")
+        print("=" * 80)
+        print(completion)
+
+        extracted = _extract_json_from_completion(completion)
+        print("\n" + "=" * 80)
+        print("EXTRACTED JSON")
+        print("=" * 80)
+        if extracted is None:
+            print("<none>")
+        else:
+            try:
+                print(json.dumps(json.loads(extracted), indent=2))
+            except json.JSONDecodeError:
+                print(extracted)
+        return
+
+    obs = openenv.env.reset(env_id=args.env_id, seed=args.seed)
+    ep_state = openenv.env.get_episode_state()
+    env_id = ep_state.env_id if ep_state is not None else args.env_id
+    episode_seed = ep_state.seed if ep_state is not None else args.seed
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend({"role": m["role"], "content": m["content"]} for m in obs.conversation)
+
+    logger.info("Collection=%s env=%s seed=%s", args.collection, env_id, episode_seed)
+
+    done = False
+    info: dict[str, Any] = {}
+    reward = 0.0
+
+    for turn in range(1, args.max_turns + 1):
+        completion, prompt_tokens = generate_completion(model, tokenizer, messages, args, device)
+        extracted = _extract_json_from_completion(completion)
+
+        print("\n" + "=" * 80)
+        print(f"TURN {turn} PROMPT TOKENS: {prompt_tokens}")
+        print("=" * 80)
+        print("COMPLETION")
+        print("=" * 80)
+        print(completion)
+
+        print("\nEXTRACTED JSON")
+        print("-" * 80)
+        if extracted is None:
+            print("<none>")
+            print("\nENV SCORE")
+            print("-" * 80)
+            print(json.dumps({"reward": -1.0, "reason": "no_valid_json"}, indent=2))
+            return
+
         try:
-            print(json.dumps(json.loads(extracted), indent=2))
+            parsed = json.loads(extracted)
+            print(json.dumps(parsed, indent=2))
         except json.JSONDecodeError:
+            parsed = None
             print(extracted)
 
-    if args.no_score:
-        return
+        obs, reward, done, info = openenv.env.step(extracted)
+
+        messages.append({"role": "assistant", "content": extracted})
+        if obs.tool_results:
+            messages.append({"role": "user", "content": format_tool_results(obs.tool_results)})
+
+        last_user = None
+        for message in reversed(obs.conversation):
+            if message["role"] == "user":
+                last_user = message["content"]
+                break
+        if last_user:
+            messages.append({"role": "user", "content": last_user})
+
+        print("\nENV STEP")
+        print("-" * 80)
+        print(json.dumps({
+            "reward": reward,
+            "done": done,
+            "turn": obs.turn,
+            "tool_results": obs.tool_results,
+            "termination_reason": info.get("termination_reason"),
+        }, indent=2, default=str))
+
+        if done:
+            break
 
     print("\n" + "=" * 80)
-    print("ENV SCORE")
+    print("FINAL ENV SCORE")
     print("=" * 80)
-    if extracted is None:
-        print(json.dumps({"reward": -1.0, "reason": "no_valid_json"}, indent=2))
-        return
+    print(json.dumps({
+        "reward": reward,
+        "is_correct": info.get("is_correct", False),
+        "turn": info.get("turn"),
+        "termination_reason": info.get("termination_reason", "max_turns"),
+        "reward_breakdown": info.get("reward_breakdown", {}),
+    }, indent=2, default=str))
 
-    result = openenv.evaluate_completion(
-        completion=extracted,
-        env_id=env_id,
-        episode_seed=episode_seed,
-    )
-    print(json.dumps(result, indent=2, default=str))
+    return
 
 
 if __name__ == "__main__":
