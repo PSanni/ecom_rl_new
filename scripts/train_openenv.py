@@ -583,7 +583,13 @@ def main() -> None:
     from unsloth import FastLanguageModel
 
     load_in_4bit = args.load_in_4bit and not args.load_in_16bit
-    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    # Unsloth's 4-bit bnb Qwen fast-LoRA path can keep activations in fp16 even
+    # on bf16-capable GPUs, so keep the trainer/model dtype aligned with that.
+    use_bf16 = (
+        torch.cuda.is_available()
+        and torch.cuda.is_bf16_supported()
+        and not load_in_4bit
+    )
     model_dtype = torch.bfloat16 if use_bf16 else torch.float16
     logger.info(
         "Precision: model dtype=%s, trainer bf16=%s, trainer fp16=%s",
