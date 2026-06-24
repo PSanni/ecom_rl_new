@@ -22,6 +22,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -67,7 +68,7 @@ Important:
 
 Available tools include:
 - user_get_visit_history()
-- catalog_search(query, filters_json, top_k)
+- catalog_search(query, cat, price_max, color, brand, filters_json, top_k)
 - catalog_rerank(query, candidate_product_ids_json, top_k)
 - catalog_get_product(product_id)
 - catalog_get_variants(product_id)
@@ -87,7 +88,7 @@ Available tools include:
          selected_line_id, policy_answer)
 
 Examples:
-- Product discovery: catalog_search(...) -> finish("I found a matching product.", "[\"product_id_from_search\"]")
+- Product discovery: catalog_search("orange STEM toy", "toys/educational/stem", 93.07, "orange", "", "", 5) -> finish("I found a matching product.", "[\"product_id_from_search\"]")
 - Cart: user_get_visit_history() -> cart_add("product_id_from_history", null, 1) -> finish("Added it to your cart.", "[]")
 - Return: order_list(...) -> return_initiate(...) -> finish("Your return has been started.", "[]", "order_id", "line_id")
 - Policy: policy_search(...) -> finish("The policy says ...", "[]", "", "", "final policy answer")
@@ -113,6 +114,80 @@ def _json_loads_or_default(value: str | None, default: Any) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return default
+
+
+def _price_from_query(query: str) -> float | None:
+    match = re.search(r"\$\s*([0-9]+(?:\.[0-9]+)?)", query)
+    if match is None:
+        return None
+    return float(match.group(1))
+
+
+def _normalize_catalog_filters(
+    query: str,
+    filters_json: str,
+    cat: str,
+    price_max: float | int | str | None,
+    color: str,
+    brand: str,
+) -> dict[str, Any] | None:
+    """Translate model-friendly search args to the catalog tool's filter schema."""
+    raw_filters = _json_loads_or_default(filters_json, {})
+    filters = raw_filters if isinstance(raw_filters, dict) else {}
+
+    normalized: dict[str, Any] = {}
+
+    raw_cat = cat or filters.get("cat") or filters.get("category")
+    if isinstance(raw_cat, str) and raw_cat:
+        # The underlying catalog expects exact slash-path categories. Short
+        # labels like "toys" are better left to the semantic query than forced
+        # into an exact metadata filter that would remove all deeper categories.
+        if "/" in raw_cat:
+            normalized["cat"] = raw_cat
+
+    raw_price_max = price_max
+    if raw_price_max in (None, ""):
+        raw_price_max = filters.get("price_max")
+    if raw_price_max in (None, "") and isinstance(filters.get("price"), dict):
+        price_filter = filters["price"]
+        raw_price_max = (
+            price_filter.get("$lt")
+            or price_filter.get("$lte")
+            or price_filter.get("lt")
+            or price_filter.get("lte")
+        )
+    if raw_price_max not in (None, ""):
+        try:
+            parsed_price_max = float(raw_price_max)
+            query_price = _price_from_query(query)
+            if query_price is not None and parsed_price_max > query_price * 10:
+                parsed_price_max = query_price
+            normalized["price_max"] = parsed_price_max
+        except (TypeError, ValueError):
+            pass
+
+    for key, explicit in (("color", color), ("brand", brand)):
+        raw_value = explicit or filters.get(key)
+        if isinstance(raw_value, str) and raw_value:
+            normalized[key] = raw_value
+
+    for key in (
+        "price_min",
+        "rating_min",
+        "rating_max",
+        "ship_days_max",
+        "size",
+        "material",
+        "connector_type",
+        "item_form",
+        "skin_type",
+        "finish_type",
+        "store",
+    ):
+        if key in filters and key not in normalized:
+            normalized[key] = filters[key]
+
+    return normalized or None
 
 
 def _trim_result(result: Any, limit: int = 6000) -> str:
@@ -218,18 +293,38 @@ class EcomRLVEMultiTurnEnv:
         """
         return self._execute_tool("user.get_visit_history", {})
 
-    def catalog_search(self, query: str, filters_json: str = "", top_k: int = 10) -> str:
+    def catalog_search(
+        self,
+        query: str,
+        cat: str = "",
+        price_max: float | int | str | None = None,
+        color: str = "",
+        brand: str = "",
+        filters_json: str = "",
+        top_k: int = 10,
+    ) -> str:
         """Search the product catalog.
 
         Args:
             query: Natural-language search query.
-            filters_json: Optional JSON object string for filters.
+            cat: Optional exact slash-path category, e.g. toys/educational/stem.
+            price_max: Optional maximum product price in dollars.
+            color: Optional exact color filter.
+            brand: Optional exact brand filter.
+            filters_json: Optional extra JSON filters using catalog keys.
             top_k: Number of results to return.
 
         Returns:
             Matching products.
         """
-        filters = _json_loads_or_default(filters_json, None)
+        filters = _normalize_catalog_filters(
+            query=query,
+            filters_json=filters_json,
+            cat=cat,
+            price_max=price_max,
+            color=color,
+            brand=brand,
+        )
         return self._execute_tool(
             "catalog.search",
             {"query": query, "filters": filters, "top_k": top_k},
