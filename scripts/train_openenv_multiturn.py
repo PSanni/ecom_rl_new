@@ -63,6 +63,9 @@ Important:
   recommending them. Then call finish with recommended_product_ids_json set to a
   JSON list of product IDs from the tool results, for example:
   finish("I found two matching options.", "[\"B001\", \"B002\"]")
+- Only call catalog_rerank with product IDs returned by catalog_search. If
+  search returns no products, search again with broader query/filters instead
+  of reranking an empty list.
 - For returns and order status, inspect orders before selecting an order/line.
 - For policy questions, search policy before answering.
 
@@ -285,6 +288,34 @@ class EcomRLVEMultiTurnEnv:
         )
         return _trim_result(entry)
 
+    def _record_tool_observation(
+        self,
+        name: str,
+        args: dict[str, Any],
+        result: Any,
+        message: str,
+    ) -> str:
+        """Append a non-error tool observation without calling the tool registry."""
+        state = self.env.get_episode_state()
+        if state is None:
+            raise ValueError("Environment has not been reset.")
+        entry = {
+            "name": name,
+            "args": args,
+            "result": result,
+            "error": None,
+            "message": message,
+            "duration_ms": 0.0,
+        }
+        state.tool_results_history.append(entry)
+        self._debug(
+            "tool=%s args=%s error=None result=%s",
+            name,
+            json.dumps(args, default=str),
+            _trim_result(entry, limit=int(_FACTORY_CONFIG["debug_result_chars"])),
+        )
+        return _trim_result(entry)
+
     def user_get_visit_history(self) -> str:
         """Get the customer's recently viewed products.
 
@@ -347,6 +378,16 @@ class EcomRLVEMultiTurnEnv:
             Reranked products.
         """
         ids = _json_loads_or_default(candidate_product_ids_json, [])
+        if not isinstance(ids, list):
+            ids = []
+        ids = [pid for pid in ids if isinstance(pid, str) and pid]
+        if not ids:
+            return self._record_tool_observation(
+                "catalog.rerank",
+                {"query": query, "candidate_product_ids": [], "top_k": top_k},
+                [],
+                "No candidate product IDs were provided. Run catalog_search again with broader query or filters.",
+            )
         return self._execute_tool(
             "catalog.rerank",
             {"query": query, "candidate_product_ids": ids, "top_k": top_k},
