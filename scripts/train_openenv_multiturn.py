@@ -654,6 +654,15 @@ def main() -> None:
     if args.disable_thinking:
         config_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
 
+    per_device_train_batch_size = max(args.batch_size, args.num_generations)
+    if per_device_train_batch_size != args.batch_size:
+        logger.info(
+            "Adjusting per-device batch size from %d to num_generations=%d "
+            "so GRPO generation_batch_size is divisible by num_generations.",
+            args.batch_size,
+            args.num_generations,
+        )
+
     training_args = GRPOConfig(
         temperature=args.temperature,
         max_completion_length=args.max_completion_length,
@@ -663,7 +672,7 @@ def main() -> None:
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
         optim="adamw_8bit",
-        per_device_train_batch_size=args.batch_size,
+        per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_steps=args.max_steps,
         logging_steps=1,
