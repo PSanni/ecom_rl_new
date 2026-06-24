@@ -501,7 +501,17 @@ def build_dataset(n_prompts: int, collection: str, env_id: str | None) -> "Datas
     for i in range(n_prompts):
         eid = env_ids[i % len(env_ids)]
         rows.append({
-            "prompt": [{"role": "system", "content": SYSTEM_PROMPT}],
+            "prompt": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        "Start the e-commerce task. Read the environment "
+                        "observation, use tools as needed, and call finish "
+                        "when the task is complete."
+                    ),
+                },
+            ],
             "env_id": eid,
             "episode_seed": i * 1000 + 42,
         })
