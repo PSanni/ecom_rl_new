@@ -536,7 +536,7 @@ class EcomRLVEMultiTurnEnv:
 
 def reward_func(
     environments: list[EcomRLVEMultiTurnEnv] | None = None,
-    **_: Any,
+    **kwargs: Any,
 ) -> list[float]:
     """Read final rewards from environment instances after each rollout."""
     if environments is None:
@@ -545,6 +545,17 @@ def reward_func(
             "a GRPOTrainer version with environment_factory support and must not "
             "use the Unsloth-patched single-turn GRPOTrainer."
         )
+    if any(env.debug_enabled for env in environments):
+        debug_kwargs: dict[str, Any] = {}
+        for key, value in kwargs.items():
+            if key in {"prompts", "completions", "completion_ids"}:
+                text = repr(value)
+                if len(text) > int(_FACTORY_CONFIG["debug_result_chars"]):
+                    text = text[: int(_FACTORY_CONFIG["debug_result_chars"])] + "... <truncated>"
+                debug_kwargs[key] = text
+            else:
+                debug_kwargs[key] = type(value).__name__
+        logger.info("[reward_func] kwargs=%s", json.dumps(debug_kwargs, default=str))
     rewards = []
     for env in environments:
         env.ensure_finished()
