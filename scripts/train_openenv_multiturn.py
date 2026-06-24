@@ -549,6 +549,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_generations", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max_seq_length", type=int, default=4096)
@@ -559,9 +560,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--precision",
         type=str,
-        default="fp16",
-        choices=["fp16", "bf16"],
-        help="Training precision for the native TRL path (default: fp16)",
+        default="none",
+        choices=["none", "fp16", "bf16"],
+        help=(
+            "Trainer mixed precision for the native TRL path. Use none to "
+            "avoid AMP GradScaler issues with 4-bit training (default: none)."
+        ),
     )
     parser.add_argument("--output_dir", type=str, default="outputs/ecomrlve_multiturn")
     parser.add_argument("--save_steps", type=int, default=50)
@@ -596,6 +600,7 @@ def main() -> None:
     })
 
     load_in_4bit = args.load_in_4bit and not args.load_in_16bit
+    use_fp16 = args.precision == "fp16"
     use_bf16 = args.precision == "bf16"
     if use_bf16 and not torch.cuda.is_bf16_supported():
         raise ValueError("--precision bf16 requested, but this CUDA device does not support bf16.")
@@ -603,7 +608,13 @@ def main() -> None:
 
     logger.info("Loading model: %s", args.model)
     logger.info("Collection=%s env_id=%s", args.collection, args.env_id or "<cycle>")
-    logger.info("Precision: dtype=%s load_in_4bit=%s", model_dtype, load_in_4bit)
+    logger.info(
+        "Precision: model dtype=%s trainer fp16=%s trainer bf16=%s load_in_4bit=%s",
+        model_dtype,
+        use_fp16,
+        use_bf16,
+        load_in_4bit,
+    )
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -680,13 +691,14 @@ def main() -> None:
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_steps=args.max_steps,
+        max_grad_norm=args.max_grad_norm,
         logging_steps=1,
         save_steps=args.save_steps,
         output_dir=args.output_dir,
         report_to=args.report_to,
         seed=args.seed,
         bf16=use_bf16,
-        fp16=not use_bf16,
+        fp16=use_fp16,
         remove_unused_columns=False,
         **config_kwargs,
     )
