@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any
 
@@ -34,6 +35,19 @@ OLLAMA_MODEL: str = "qwen3.5"
 OLLAMA_TIMEOUT: int = 30  # seconds per request
 OLLAMA_TEMPERATURE: float = 0.7
 OLLAMA_MAX_TOKENS: int = 200
+LLM_PROVIDER: str = os.getenv("ECOM_RLVE_USER_SIM_PROVIDER", "ollama").lower()
+OPENAI_MODEL: str = (
+    os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+    or os.getenv("OPENAI_USER_SIM_MODEL")
+    or os.getenv("OPENAI_DEPLOYMENT_NAME")
+    or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+)
+OPENAI_BASE_URL: str | None = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("OPENAI_BASE_URL")
+if OPENAI_BASE_URL:
+    OPENAI_BASE_URL = OPENAI_BASE_URL.rstrip("/")
+OPENAI_API_KEY: str | None = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+
+_openai_client: Any | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -48,11 +62,10 @@ def _ollama_generate(
     max_tokens: int = OLLAMA_MAX_TOKENS,
     system_prompt: str | None = None,
 ) -> str | None:
-    """Call Ollama's /api/chat endpoint with thinking disabled.
+    """Generate text with the configured user-simulator backend.
 
-    Uses the chat completions API with ``think: false`` so that
-    thinking-enabled models (like qwen3.5) produce content directly
-    without exhausting the token budget on internal reasoning.
+    Defaults to Ollama for backwards compatibility. Set
+    ``ECOM_RLVE_USER_SIM_PROVIDER=openai`` to use the OpenAI SDK instead.
 
     Args:
         prompt:        The user message string.
@@ -64,6 +77,15 @@ def _ollama_generate(
     Returns:
         Generated text string, or None if the call fails.
     """
+    if LLM_PROVIDER == "openai":
+        return _openai_generate(
+            prompt=prompt,
+            seed=seed,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+        )
+
     messages: list[dict[str, str]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -94,6 +116,64 @@ def _ollama_generate(
         return text if text else None
     except (requests.RequestException, json.JSONDecodeError, KeyError) as exc:
         logger.warning("Ollama call failed: %s", exc)
+        return None
+
+
+def _get_openai_client() -> Any:
+    """Lazy-create an OpenAI client for user simulation."""
+    global _openai_client
+    if _openai_client is not None:
+        return _openai_client
+
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("openai package is required for OpenAI user simulation") from exc
+
+    kwargs: dict[str, Any] = {"timeout": OLLAMA_TIMEOUT}
+    if OPENAI_BASE_URL:
+        kwargs["base_url"] = OPENAI_BASE_URL
+        kwargs["api_key"] = OPENAI_API_KEY or "not-needed"
+    _openai_client = OpenAI(**kwargs)
+    return _openai_client
+
+
+def _openai_generate(
+    prompt: str,
+    seed: int = 42,
+    temperature: float = OLLAMA_TEMPERATURE,
+    max_tokens: int = OLLAMA_MAX_TOKENS,
+    system_prompt: str | None = None,
+) -> str | None:
+    """Call OpenAI or an OpenAI-compatible chat-completions endpoint."""
+    messages: list[dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    try:
+        client = _get_openai_client()
+        try:
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                temperature=temperature,
+                max_completion_tokens=max_tokens,
+                seed=seed,
+            )
+        except Exception:
+            # Some compatible endpoints do not support seed.
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                temperature=temperature,
+                max_completion_tokens=max_tokens,
+            )
+        text = (response.choices[0].message.content or "").strip()
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        return text if text else None
+    except Exception as exc:
+        logger.warning("OpenAI user-simulator call failed: %s", exc)
         return None
 
 
@@ -324,7 +404,8 @@ def extract_product_type(title: str, brand: str = "") -> str:
 
     import re
 
-    text = title.strip()
+    original_title = title.strip()
+    text = original_title
 
     # Truncate at comma or dash — usually signals spec repetition
     # e.g. "Galaxy S9 Plus Case, Galaxy S9 Plus Phone Case" → first part
@@ -374,12 +455,7 @@ def extract_product_type(title: str, brand: str = "") -> str:
             break
 
     if not kept:
-        # Fallback to category leaf
-        cat = d.get("category", "") if isinstance(d, dict) else ""
-        if cat:
-            leaf = cat.split("/")[-1] if "/" in cat else cat
-            return leaf.lower() if leaf.isupper() else leaf
-        return "an item"
+        return original_title[:80] if original_title else "an item"
 
     return " ".join(kept)
 

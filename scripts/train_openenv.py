@@ -46,6 +46,25 @@ _SRC_DIR = _PROJECT_ROOT / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+
+def load_env_file(path: Path) -> None:
+    """Load simple KEY=VALUE pairs from a .env file without extra dependencies."""
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_env_file(_PROJECT_ROOT / ".env")
+
 from ecom_rlve.server.openenv import EcomRLVEEnv
 from ecom_rlve.server.state import parse_action
 from ecom_rlve.training.collections import COLLECTIONS, get_collection
@@ -533,6 +552,16 @@ def main() -> None:
     logger.info("Group size: %d (G)", args.num_generations)
     logger.info("LR:         %s", args.learning_rate)
     logger.info("Output:     %s", args.output_dir)
+    logger.info(
+        "User sim:   provider=%s model=%s endpoint=%s has_key=%s",
+        os.getenv("ECOM_RLVE_USER_SIM_PROVIDER", "ollama"),
+        os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+        or os.getenv("OPENAI_USER_SIM_MODEL")
+        or os.getenv("OPENAI_MODEL")
+        or "qwen3.5",
+        os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("OPENAI_BASE_URL") or "ollama-local",
+        bool(os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")),
+    )
     logger.info("=" * 70)
 
     # ------------------------------------------------------------------
