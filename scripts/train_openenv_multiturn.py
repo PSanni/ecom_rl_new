@@ -70,9 +70,10 @@ correspond to the tool names above, for example catalog_search for
 catalog.search, catalog_rerank for catalog.rerank, cart_add for cart.add, and
 policy_search for policy.search.
 
-When you have found the answer, call finish with the final user-facing message
-and answer fields. For product recommendations, pass recommended_product_ids_json
-as a JSON list of product IDs returned by tools.
+When you have found the answer, call the finish tool. Do not write the final
+answer as plain assistant text after tool results. For product recommendations,
+call finish with recommended_product_ids_json set to a JSON list of product IDs
+returned by tools.
 """
 
 
@@ -600,14 +601,16 @@ class EcomRLVEMultiTurnEnv:
             return
         state = self.env.get_episode_state()
         tool_history = state.tool_results_history if state is not None else []
+        seen_product_ids = sorted(state.seen_product_ids) if state is not None else []
         self._debug(
-            "fallback_finish invalid_tool=%s tool_history=%s",
+            "fallback_finish invalid_tool=%s seen_product_ids=%s tool_history=%s",
             self.invalid_tool,
+            json.dumps(seen_product_ids),
             _trim_result(tool_history, limit=int(_FACTORY_CONFIG["debug_result_chars"])),
         )
         self.finish(
             assistant_message="I have completed the task.",
-            recommended_product_ids_json="[]",
+            recommended_product_ids_json=json.dumps(seen_product_ids),
         )
 
 
