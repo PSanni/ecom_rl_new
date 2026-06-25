@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 
 import numpy as np
@@ -197,6 +198,17 @@ class VectorIndex:
         # Clamp top_k to available vectors
         n_allowed = len(self._allowed_positions) if self._allowed_positions is not None else self._index.ntotal
         effective_k = min(top_k, n_allowed)
+        logger.info(
+            "VectorIndex.search: start top_k=%d effective_k=%d ntotal=%d "
+            "allowed=%s factory=%s use_gpu=%s",
+            top_k,
+            effective_k,
+            self._index.ntotal,
+            n_allowed,
+            self.index_factory,
+            self.use_gpu,
+        )
+        t_start = time.monotonic()
 
         # FAISS expects a 2-D query array
         query = np.ascontiguousarray(
@@ -228,6 +240,7 @@ class VectorIndex:
         else:
             distances, indices = self._index.search(query, effective_k)
 
+        t_search = time.monotonic()
         results: list[tuple[str, float]] = []
         for dist, idx in zip(distances[0], indices[0]):
             if idx < 0:
@@ -236,6 +249,15 @@ class VectorIndex:
             product_id = self._id_map[idx]
             results.append((product_id, float(dist)))
 
+        logger.info(
+            "VectorIndex.search: returned %d results in %.3fs top=%s",
+            len(results),
+            t_search - t_start,
+            [
+                {"id": pid, "score": round(score, 4)}
+                for pid, score in results[:5]
+            ],
+        )
         return results
 
     def get_embedding(self, product_id: str) -> np.ndarray | None:
@@ -450,22 +472,43 @@ class MockVectorIndex:
             List of (product_id, score) tuples sorted by descending score.
         """
         if self._embeddings is None or len(self._id_map) == 0:
+            logger.warning("MockVectorIndex.search: search called on empty index")
+            return []
+
+        t_start = time.monotonic()
+        effective_k = min(top_k, len(self._id_map))
+        logger.info(
+            "MockVectorIndex.search: start top_k=%d effective_k=%d ntotal=%d",
+            top_k,
+            effective_k,
+            len(self._id_map),
+        )
+        if effective_k <= 0:
             return []
 
         query = query_embedding.reshape(1, -1).astype(np.float32)
         # Inner product (= cosine sim for normalized vectors)
         scores = (self._embeddings @ query.T).squeeze(axis=1)
 
-        effective_k = min(top_k, len(self._id_map))
         # Partial sort for efficiency
-        top_indices = np.argpartition(-scores, effective_k)[:effective_k]
+        top_indices = np.argpartition(-scores, effective_k - 1)[:effective_k]
         # Sort the top-k by score
         top_indices = top_indices[np.argsort(-scores[top_indices])]
 
-        return [
+        results = [
             (self._id_map[idx], float(scores[idx]))
             for idx in top_indices
         ]
+        logger.info(
+            "MockVectorIndex.search: returned %d results in %.3fs top=%s",
+            len(results),
+            time.monotonic() - t_start,
+            [
+                {"id": pid, "score": round(score, 4)}
+                for pid, score in results[:5]
+            ],
+        )
+        return results
 
     def get_embedding(self, product_id: str) -> np.ndarray | None:
         """Retrieve the stored embedding for a product ID."""

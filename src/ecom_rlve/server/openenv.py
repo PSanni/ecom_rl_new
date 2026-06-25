@@ -384,11 +384,31 @@ class EcomRLVEEnv:
 
         texts = [f"{p.title} {p.desc}" for p in self._products]
         ids = [p.id for p in self._products]
+        t_start = time.monotonic()
+        logger.info(
+            "EcomRLVEEnv: embedding %d products for vector index "
+            "(model=%s, debug=%s)",
+            len(self._products),
+            self._embedding_engine.model_name,
+            self._embedding_engine.debug_mode,
+        )
         embeddings = self._embedding_engine.encode(texts, normalize=True)
+        t_embedded = time.monotonic()
+        logger.info(
+            "EcomRLVEEnv: product embeddings ready in %.1fs; building %s",
+            t_embedded - t_start,
+            type(self._vector_index).__name__,
+        )
         self._vector_index.build(embeddings, ids)
+        t_built = time.monotonic()
 
         logger.info(
-            "EcomRLVEEnv: vector index built with %d products", len(self._products)
+            "EcomRLVEEnv: vector index built with %d products in %.1fs "
+            "(embedding %.1fs, index %.1fs)",
+            len(self._products),
+            t_built - t_start,
+            t_embedded - t_start,
+            t_built - t_embedded,
         )
 
     # ------------------------------------------------------------------

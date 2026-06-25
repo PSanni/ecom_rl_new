@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import random
+import time
 from typing import Any
 
 import numpy as np
@@ -322,17 +323,41 @@ def catalog_search(
         List of ProductCard dicts, sorted by relevance.
     """
     catalog_state: CatalogState = _get_catalog_state(state)
+    t_start = time.monotonic()
+    logger.info(
+        "catalog.search: start query=%r filters=%s top_k=%d products=%d "
+        "index=%s eps_rank=%.3f",
+        query[:160],
+        filters,
+        top_k,
+        len(catalog_state.products_by_id),
+        type(catalog_state.vector_index).__name__ if catalog_state.vector_index else None,
+        catalog_state.eps_rank,
+    )
 
     if catalog_state.vector_index is None or catalog_state.embedding_engine is None:
         logger.warning("catalog.search: no vector index or embedding engine available")
         return []
 
     # Step 1: Encode query
+    t_encode_start = time.monotonic()
     query_embedding = catalog_state.embedding_engine.encode_query(query)
+    t_encoded = time.monotonic()
+    logger.info(
+        "catalog.search: query encoded in %.3fs",
+        t_encoded - t_encode_start,
+    )
 
     # Step 2: Vector search (retrieve extra to allow for filtering)
     retrieval_k = min(top_k * 3, len(catalog_state.products_by_id))
+    logger.info("catalog.search: vector search retrieval_k=%d", retrieval_k)
     raw_results = catalog_state.vector_index.search(query_embedding, top_k=retrieval_k)
+    t_searched = time.monotonic()
+    logger.info(
+        "catalog.search: vector search produced %d candidates in %.3fs",
+        len(raw_results),
+        t_searched - t_encoded,
+    )
 
     # Step 3: Apply metadata filters
     if filters:
@@ -341,10 +366,16 @@ def catalog_search(
             product = catalog_state.products_by_id.get(pid)
             if product is not None and _apply_filters(product, filters):
                 filtered_results.append((pid, score))
+        logger.info(
+            "catalog.search: filters reduced candidates %d -> %d",
+            len(raw_results),
+            len(filtered_results),
+        )
         raw_results = filtered_results
 
     # Extract ranked IDs
     ranked_ids = [pid for pid, _score in raw_results]
+    pre_degrade_count = len(ranked_ids)
 
     # Step 4: Apply retrieval degradation
     if catalog_state.eps_rank > 0.0:
@@ -354,6 +385,11 @@ def catalog_search(
             products_by_id=catalog_state.products_by_id,
             category_index=catalog_state.category_index,
             rng=catalog_state.rng,
+        )
+        logger.info(
+            "catalog.search: retrieval degradation changed candidates %d -> %d",
+            pre_degrade_count,
+            len(ranked_ids),
         )
 
     # Truncate to top_k
@@ -373,6 +409,13 @@ def catalog_search(
         for pid in ranked_ids:
             seen_ids.add(pid)
 
+    t_done = time.monotonic()
+    logger.info(
+        "catalog.search: returned %d cards in %.3fs ids=%s",
+        len(cards),
+        t_done - t_start,
+        ranked_ids[:10],
+    )
     return cards
 
 
