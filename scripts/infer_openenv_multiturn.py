@@ -140,7 +140,7 @@ TOOL_METHODS_BY_ENV: dict[str, list[str]] = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Chat with a trained multi-turn EcomRLVE model and print reward at finish.",
+        description="Run a trained multi-turn EcomRLVE model on one normal env episode.",
     )
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument(
@@ -176,11 +176,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disable_thinking",
         type=_bool_arg,
-        default=False,
+        default=True,
         metavar="true|false",
         help=(
             "Pass enable_thinking=False to the chat template when supported. "
-            "Defaults to false to match training."
+            "Defaults to true for readable inference diagnostics."
         ),
     )
     parser.add_argument(
@@ -201,7 +201,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--debug_prompt_chars",
         type=int,
-        default=0,
+        default=4000,
         help="Print the last N characters of the rendered chat-template prompt before generation.",
     )
     parser.add_argument(
@@ -566,30 +566,6 @@ def _final_reward_payload(env: EcomRLVEMultiTurnEnv) -> dict[str, Any]:
     }
 
 
-def _read_customer_message() -> str:
-    while True:
-        try:
-            text = input("\nCustomer> ").strip()
-        except EOFError:
-            return ""
-        if text:
-            return text
-
-
-def _set_visible_customer_message(env: EcomRLVEMultiTurnEnv, message: str) -> None:
-    state = env.env.get_episode_state()
-    if state is None:
-        return
-    state.conversation = [{"role": "user", "content": message}]
-
-
-def _replace_customer_in_reset_observation(observation: str, message: str) -> str:
-    if "\n\nCustomer:" in observation:
-        prefix, _old_customer = observation.split("\n\nCustomer:", 1)
-        return f"{prefix}\n\nCustomer: {message}"
-    return f"{observation.rstrip()}\n\nCustomer: {message}"
-
-
 def _run_assistant_turn(
     *,
     env: EcomRLVEMultiTurnEnv,
@@ -772,31 +748,32 @@ def main() -> None:
     allowed_names = {tool.__name__ for tool in tools}
 
     print("\n" + "=" * 80)
-    print(f"CHAT env={env.env_id} seed={env.episode_seed}")
+    print(f"EPISODE env={env.env_id} seed={env.episode_seed}")
     print("=" * 80)
-    print("Type the customer request. Press Ctrl-D to stop without scoring.")
+    print(reset_observation)
+    print("\nTrace file:", args.trace_file)
+    print("Generation:", json.dumps({
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
+        "max_new_tokens": args.max_new_tokens,
+        "max_seq_length": args.max_seq_length,
+        "disable_thinking": args.disable_thinking,
+        "chat_template_tools": args.chat_template_tools,
+    }, indent=2))
+    print("Environment config:", json.dumps(env_config, indent=2, default=str))
 
-    customer_message = _read_customer_message()
-    if not customer_message:
-        print("\nNo customer message received.")
-        return
-
-    _set_visible_customer_message(env, customer_message)
-    visible_observation = _replace_customer_in_reset_observation(
-        reset_observation,
-        customer_message,
-    )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": _system_prompt_for_env(args.env_id)},
         {
             "role": "user",
-            "content": TRAINING_USER_STARTER + visible_observation,
+            "content": TRAINING_USER_STARTER + reset_observation,
         },
     ]
     _write_trace(args.trace_file, {
-        "event": "customer_message",
-        "message": customer_message,
-        "visible_observation": visible_observation,
+        "event": "initial_messages",
+        "reset_observation": reset_observation,
         "messages": messages,
     })
 
@@ -820,21 +797,15 @@ def main() -> None:
             })
             _print_reward(env)
             return
-        if called_tool:
-            continue
-
-        customer_message = _read_customer_message()
-        if not customer_message:
+        if not called_tool:
+            _write_trace(args.trace_file, {
+                "event": "no_tool_call_stop",
+                "messages_count": len(messages),
+            })
             break
-        messages.append({"role": "user", "content": customer_message})
-        _write_trace(args.trace_file, {
-            "event": "customer_message",
-            "message": customer_message,
-            "messages_count": len(messages),
-        })
 
     if not env.done and args.force_finish_on_max_rounds:
-        print("\nModel did not call finish before chat ended; applying fallback scoring.")
+        print("\nModel did not call finish before inference ended; applying fallback scoring.")
         env.ensure_finished()
     _write_trace(args.trace_file, {
         "event": "final_reward",
