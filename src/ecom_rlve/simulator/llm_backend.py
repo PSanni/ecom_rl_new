@@ -50,6 +50,54 @@ OPENAI_API_KEY: str | None = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPE
 _openai_client: Any | None = None
 
 
+def configure_user_sim_backend(
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    timeout: int | None = None,
+) -> None:
+    """Configure the user-simulator LLM backend at runtime.
+
+    Environment variables are read when this module is imported, but training
+    scripts often parse CLI flags later. This helper lets scripts select
+    OpenAI/Azure explicitly before constructing environments.
+    """
+    global LLM_PROVIDER
+    global OPENAI_MODEL
+    global OPENAI_BASE_URL
+    global OPENAI_API_KEY
+    global OLLAMA_TIMEOUT
+    global _openai_client
+
+    if provider is not None:
+        LLM_PROVIDER = provider.strip().lower()
+        if LLM_PROVIDER not in {"openai", "ollama"}:
+            raise ValueError(
+                f"Unsupported user-simulator provider {provider!r}; "
+                "expected 'openai' or 'ollama'."
+            )
+    if model:
+        OPENAI_MODEL = model
+    if base_url:
+        OPENAI_BASE_URL = base_url.rstrip("/")
+    if api_key:
+        OPENAI_API_KEY = api_key
+    if timeout is not None:
+        OLLAMA_TIMEOUT = timeout
+
+    # Recreate the client on the next request after any config change.
+    _openai_client = None
+    logger.info(
+        "User simulator LLM backend configured: provider=%s model=%s base_url=%s api_key=%s",
+        LLM_PROVIDER,
+        OPENAI_MODEL,
+        OPENAI_BASE_URL or "<default>",
+        "set" if OPENAI_API_KEY else "missing",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Low-level Ollama client
 # ---------------------------------------------------------------------------
