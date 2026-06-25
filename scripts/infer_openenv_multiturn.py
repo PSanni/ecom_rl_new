@@ -167,8 +167,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--disable_thinking",
-        action="store_true",
-        help="Pass enable_thinking=False to the chat template when supported.",
+        type=_bool_arg,
+        default=True,
+        metavar="true|false",
+        help="Pass enable_thinking=False to the chat template when supported. Defaults to true for chat inference.",
     )
     parser.add_argument(
         "--chat_template_tools",
@@ -273,7 +275,7 @@ def _stream_generate(
     streamer = TextIteratorStreamer(
         tokenizer,
         skip_prompt=True,
-        skip_special_tokens=False,
+        skip_special_tokens=True,
     )
     generate_kwargs = {
         **inputs,
@@ -302,7 +304,9 @@ def _stream_generate(
 
 
 def _strip_thinking(text: str) -> str:
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<\|im_end\|>", "", text)
+    return text.strip()
 
 
 def _json_loads_maybe(value: Any) -> Any:
@@ -513,7 +517,7 @@ def _run_assistant_turn(
     """
     print("\nAssistant> ", end="", flush=True)
     completion = _stream_generate(model, tokenizer, messages, tools, args)
-    messages.append({"role": "assistant", "content": completion})
+    messages.append({"role": "assistant", "content": _strip_thinking(completion)})
 
     calls = parse_tool_calls(completion, allowed_names)
     if not calls:
