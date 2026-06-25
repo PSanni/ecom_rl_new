@@ -57,6 +57,7 @@ def _load_env_file(path: Path) -> None:
 _load_env_file(_PROJECT_ROOT / ".env")
 
 from ecom_rlve.training.collections import COLLECTIONS, get_collection
+from ecom_rlve.simulator import llm_backend
 from train_openenv_multiturn import (
     EcomRLVEMultiTurnEnv,
     _FACTORY_CONFIG,
@@ -156,7 +157,12 @@ def parse_args() -> argparse.Namespace:
         choices=sorted(COLLECTIONS.keys()),
     )
     parser.add_argument("--env_id", type=str, default="CART")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Episode seed. Omit to sample a fresh random episode each run.",
+    )
     parser.add_argument("--difficulty", type=int, default=None)
     parser.add_argument("--max_seq_length", type=int, default=4096)
     parser.add_argument("--max_new_tokens", type=int, default=4096)
@@ -668,6 +674,9 @@ def main() -> None:
             f"--env_id {args.env_id!r} is not in --collection {args.collection}: "
             f"{sorted(valid_env_ids)}"
         )
+    episode_seed = args.seed
+    if episode_seed is None:
+        episode_seed = int.from_bytes(os.urandom(4), "big") % (2**31)
 
     env_config = {
         "disclose_env_id": True,
@@ -685,7 +694,7 @@ def main() -> None:
     env_config.update({key: value for key, value in optional_env_config.items() if value is not None})
     _FACTORY_CONFIG.update({
         "collection": args.collection,
-        "seed": args.seed,
+        "seed": episode_seed,
         "env_id": args.env_id,
         "difficulty": args.difficulty,
         "config": env_config,
@@ -697,6 +706,13 @@ def main() -> None:
     })
 
     logger.info("Loading model=%s adapter=%s", args.model, args.adapter or "<none>")
+    logger.info(
+        "User simulator backend: provider=%s openai_model=%s openai_base_url=%s api_key=%s",
+        llm_backend.LLM_PROVIDER,
+        llm_backend.OPENAI_MODEL,
+        llm_backend.OPENAI_BASE_URL or "<default>",
+        "set" if llm_backend.OPENAI_API_KEY else "missing",
+    )
     logger.info(
         "Generation: temperature=%s top_p=%s top_k=%s min_p=%s "
         "max_new_tokens=%s thinking=%s chat_template_tools=%s",
@@ -716,7 +732,7 @@ def main() -> None:
         args.trace_file = str(
             trace_base
             / "inference_traces"
-            / f"{int(time.time())}_{args.env_id.lower()}_{args.seed}.jsonl"
+            / f"{int(time.time())}_{args.env_id.lower()}_{episode_seed}.jsonl"
         )
     logger.info("Inference trace file: %s", args.trace_file)
     model, tokenizer = _load_model_and_tokenizer(args)
@@ -725,13 +741,19 @@ def main() -> None:
     reset_observation = env.reset(
         env_id=args.env_id,
         difficulty=args.difficulty,
-        episode_seed=args.seed,
+        episode_seed=episode_seed,
     )
     _write_trace(args.trace_file, {
         "event": "env_reset",
         "env_id": env.env_id,
         "episode_seed": env.episode_seed,
         "reset_observation": reset_observation,
+        "user_sim_backend": {
+            "provider": llm_backend.LLM_PROVIDER,
+            "openai_model": llm_backend.OPENAI_MODEL,
+            "openai_base_url": llm_backend.OPENAI_BASE_URL or "<default>",
+            "openai_api_key": "set" if llm_backend.OPENAI_API_KEY else "missing",
+        },
         "env_config": env_config,
         "generation": {
             "temperature": args.temperature,
@@ -752,6 +774,12 @@ def main() -> None:
     print("=" * 80)
     print(reset_observation)
     print("\nTrace file:", args.trace_file)
+    print("User simulator backend:", json.dumps({
+        "provider": llm_backend.LLM_PROVIDER,
+        "openai_model": llm_backend.OPENAI_MODEL,
+        "openai_base_url": llm_backend.OPENAI_BASE_URL or "<default>",
+        "openai_api_key": "set" if llm_backend.OPENAI_API_KEY else "missing",
+    }, indent=2))
     print("Generation:", json.dumps({
         "temperature": args.temperature,
         "top_p": args.top_p,
