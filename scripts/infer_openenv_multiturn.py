@@ -303,6 +303,16 @@ def _stream_generate(
         truncation=True,
         max_length=args.max_seq_length,
     ).to(model.device)
+    decoded_input_tail = tokenizer.decode(
+        inputs["input_ids"][0][-min(inputs["input_ids"].shape[-1], 1024):],
+        skip_special_tokens=False,
+    )
+    _write_trace(args.trace_file, {
+        "event": "tokenized_prompt",
+        "input_tokens": int(inputs["input_ids"].shape[-1]),
+        "max_seq_length": args.max_seq_length,
+        "decoded_input_tail": decoded_input_tail,
+    })
     streamer = TextIteratorStreamer(
         tokenizer,
         skip_prompt=True,
@@ -511,6 +521,7 @@ def _load_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any]:
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.truncation_side = "left"
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
@@ -598,11 +609,28 @@ def _run_assistant_turn(
     print("\nAssistant> ", end="", flush=True)
     completion = _stream_generate(model, tokenizer, messages, tools, args)
     calls = parse_tool_calls(completion, allowed_names)
+    state = env.env.get_episode_state()
+    prior_tool_calls = []
+    if state is not None:
+        for entry in state.tool_results_history:
+            prior_tool_calls.append({
+                "name": str(entry.get("name", "")),
+                "args": entry.get("args", {}),
+            })
+    repeated_calls = []
+    for call in calls:
+        registry_name = call["name"].replace("_", ".", 1)
+        if any(
+            prior.get("name") == registry_name and prior.get("args") == call["args"]
+            for prior in prior_tool_calls
+        ):
+            repeated_calls.append(call)
     _write_trace(args.trace_file, {
         "event": "assistant_turn",
         "round_index": round_index,
         "completion": completion,
         "parsed_tool_calls": calls,
+        "repeated_tool_calls": repeated_calls,
         "message_count_before_append": len(messages),
     })
     if not calls:
