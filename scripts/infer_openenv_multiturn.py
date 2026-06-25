@@ -70,6 +70,13 @@ logging.basicConfig(
 logger = logging.getLogger("ecomrlve.infer_openenv_multiturn")
 
 
+TRAINING_USER_STARTER = (
+    "A customer has started a shopping conversation. Help "
+    "them using the available tools when needed, then call "
+    "finish with the final result.\n\n"
+)
+
+
 TOOL_METHODS_BY_ENV: dict[str, list[str]] = {
     "PD": [
         "catalog_search",
@@ -150,8 +157,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env_id", type=str, default="CART")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--difficulty", type=int, default=None)
-    parser.add_argument("--max_seq_length", type=int, default=8192)
-    parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--max_seq_length", type=int, default=4096)
+    parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--max_tool_rounds", type=int, default=12)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
@@ -168,9 +175,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disable_thinking",
         type=_bool_arg,
-        default=True,
+        default=False,
         metavar="true|false",
-        help="Pass enable_thinking=False to the chat template when supported. Defaults to true for chat inference.",
+        help=(
+            "Pass enable_thinking=False to the chat template when supported. "
+            "Defaults to false to match training."
+        ),
     )
     parser.add_argument(
         "--chat_template_tools",
@@ -186,7 +196,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--faiss_index_factory", type=str, default=None)
     parser.add_argument("--faiss_use_gpu", type=_bool_arg, default=None, metavar="true|false")
     parser.add_argument("--faiss_index_path", type=str, default=None)
-    parser.add_argument("--debug_result_chars", type=int, default=2000)
+    parser.add_argument("--debug_result_chars", type=int, default=1200)
     parser.add_argument(
         "--force_finish_on_max_rounds",
         type=_bool_arg,
@@ -213,9 +223,8 @@ def _render_prompt(
     kwargs: dict[str, Any] = {
         "tokenize": False,
         "add_generation_prompt": True,
+        "enable_thinking": not disable_thinking,
     }
-    if disable_thinking:
-        kwargs["enable_thinking"] = False
     if include_tools and tools:
         kwargs["tools"] = tools
 
@@ -223,31 +232,7 @@ def _render_prompt(
         return tokenizer.apply_chat_template(messages, **kwargs)
     except TypeError:
         kwargs.pop("enable_thinking", None)
-        try:
-            return tokenizer.apply_chat_template(messages, **kwargs)
-        except Exception:
-            kwargs.pop("tools", None)
-            return tokenizer.apply_chat_template(_tool_messages_as_user(messages), **kwargs)
-    except Exception:
-        kwargs.pop("tools", None)
-        return tokenizer.apply_chat_template(_tool_messages_as_user(messages), **kwargs)
-
-
-def _tool_messages_as_user(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
-    converted: list[dict[str, str]] = []
-    for message in messages:
-        if message.get("role") == "tool":
-            name = message.get("name", "tool")
-            converted.append({
-                "role": "user",
-                "content": f"Tool result from {name}:\n{message.get('content', '')}",
-            })
-        else:
-            converted.append({
-                "role": str(message.get("role", "user")),
-                "content": str(message.get("content", "")),
-            })
-    return converted
+        return tokenizer.apply_chat_template(messages, **kwargs)
 
 
 def _stream_generate(
@@ -405,6 +390,33 @@ def parse_tool_calls(text: str, allowed_names: set[str]) -> list[dict[str, Any]]
     return _parse_python_tool_calls(text, allowed_names)
 
 
+def _assistant_message_with_tool_calls(
+    completion: str,
+    calls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    content = _strip_thinking(completion)
+    for pattern in [
+        r"<tool_call>\s*.*?\s*</tool_call>",
+        r"```(?:json)?\s*\{.*?\"name\".*?\}\s*```",
+    ]:
+        content = re.sub(pattern, "", content, flags=re.DOTALL).strip()
+
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {
+                "type": "function",
+                "function": {
+                    "name": call["name"],
+                    "arguments": json.dumps(call["args"], default=str),
+                },
+            }
+            for call in calls
+        ],
+    }
+
+
 def _load_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -499,6 +511,13 @@ def _set_visible_customer_message(env: EcomRLVEMultiTurnEnv, message: str) -> No
     state.conversation = [{"role": "user", "content": message}]
 
 
+def _replace_customer_in_reset_observation(observation: str, message: str) -> str:
+    if "\n\nCustomer:" in observation:
+        prefix, _old_customer = observation.split("\n\nCustomer:", 1)
+        return f"{prefix}\n\nCustomer: {message}"
+    return f"{observation.rstrip()}\n\nCustomer: {message}"
+
+
 def _run_assistant_turn(
     *,
     env: EcomRLVEMultiTurnEnv,
@@ -517,11 +536,12 @@ def _run_assistant_turn(
     """
     print("\nAssistant> ", end="", flush=True)
     completion = _stream_generate(model, tokenizer, messages, tools, args)
-    messages.append({"role": "assistant", "content": _strip_thinking(completion)})
-
     calls = parse_tool_calls(completion, allowed_names)
     if not calls:
+        messages.append({"role": "assistant", "content": _strip_thinking(completion)})
         return False
+
+    messages.append(_assistant_message_with_tool_calls(completion, calls))
 
     for call in calls:
         name = call["name"]
@@ -579,10 +599,26 @@ def main() -> None:
     })
 
     logger.info("Loading model=%s adapter=%s", args.model, args.adapter or "<none>")
+    logger.info(
+        "Generation: temperature=%s top_p=%s top_k=%s min_p=%s "
+        "max_new_tokens=%s thinking=%s chat_template_tools=%s",
+        args.temperature,
+        args.top_p,
+        args.top_k,
+        args.min_p,
+        args.max_new_tokens,
+        "disabled" if args.disable_thinking else "enabled",
+        args.chat_template_tools,
+    )
+    logger.info("Environment config: %s", json.dumps(env_config, default=str))
     model, tokenizer = _load_model_and_tokenizer(args)
 
     env = EcomRLVEMultiTurnEnv()
-    env.reset(env_id=args.env_id, difficulty=args.difficulty, episode_seed=args.seed)
+    reset_observation = env.reset(
+        env_id=args.env_id,
+        difficulty=args.difficulty,
+        episode_seed=args.seed,
+    )
     tools = _tool_functions(env, args.env_id)
     allowed_names = {tool.__name__ for tool in tools}
 
@@ -597,15 +633,15 @@ def main() -> None:
         return
 
     _set_visible_customer_message(env, customer_message)
+    visible_observation = _replace_customer_in_reset_observation(
+        reset_observation,
+        customer_message,
+    )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": _system_prompt_for_env(args.env_id)},
         {
             "role": "user",
-            "content": (
-                f"Task env: {env.env_id}\n"
-                f"Difficulty: {args.difficulty if args.difficulty is not None else 'sampled'}\n\n"
-                f"Customer: {customer_message}"
-            ),
+            "content": TRAINING_USER_STARTER + visible_observation,
         },
     ]
 
