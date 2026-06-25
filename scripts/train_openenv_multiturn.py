@@ -99,6 +99,17 @@ def _json_loads_or_default(value: str | None, default: Any) -> Any:
         return default
 
 
+def _bool_arg(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"expected a boolean value, got {value!r}"
+    )
+
+
 def _trim_result(result: Any, limit: int = 6000) -> str:
     text = json.dumps(result, indent=2, default=str)
     if len(text) > limit:
@@ -770,6 +781,46 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--embedding_debug",
+        type=_bool_arg,
+        default=None,
+        metavar="true|false",
+        help=(
+            "Override environment embedding debug mode. Use false to build "
+            "a real semantic catalog index for synthetic catalogs."
+        ),
+    )
+    parser.add_argument(
+        "--embedding_model",
+        type=str,
+        default=None,
+        help="Optional SentenceTransformer model for catalog retrieval.",
+    )
+    parser.add_argument(
+        "--embedding_device",
+        type=str,
+        default=None,
+        help="Optional embedding device, e.g. cuda:0, mps, or cpu.",
+    )
+    parser.add_argument(
+        "--n_synthetic_products",
+        type=int,
+        default=None,
+        help="Optional synthetic catalog size override.",
+    )
+    parser.add_argument(
+        "--faiss_index_factory",
+        type=str,
+        default=None,
+        help="Optional FAISS index factory when real embeddings are enabled.",
+    )
+    parser.add_argument(
+        "--faiss_index_path",
+        type=str,
+        default=None,
+        help="Optional path to a prebuilt FAISS index directory.",
+    )
+    parser.add_argument(
         "--disable_thinking",
         action="store_true",
         help=(
@@ -801,10 +852,29 @@ def main() -> None:
             f"{sorted(valid_env_ids)}"
         )
 
+    env_config = {
+        "disclose_env_id": True,
+        "disclose_difficulty": True,
+    }
+    optional_env_config = {
+        "embedding_debug": args.embedding_debug,
+        "embedding_model": args.embedding_model,
+        "embedding_device": args.embedding_device,
+        "n_synthetic_products": args.n_synthetic_products,
+        "faiss_index_factory": args.faiss_index_factory,
+        "faiss_index_path": args.faiss_index_path,
+    }
+    env_config.update({
+        key: value
+        for key, value in optional_env_config.items()
+        if value is not None
+    })
+
     _FACTORY_CONFIG.update({
         "collection": args.collection,
         "seed": args.seed,
         "env_id": args.env_id,
+        "config": env_config,
         "debug_rollouts": args.debug_rollouts,
         "debug_result_chars": args.debug_result_chars,
     })
@@ -825,6 +895,7 @@ def main() -> None:
         use_bf16,
         load_in_4bit,
     )
+    logger.info("Environment config: %s", json.dumps(env_config, default=str))
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
