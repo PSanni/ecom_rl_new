@@ -1053,6 +1053,38 @@ class EcomRLVEEnv:
                 "difficulty": state.difficulty,
             }
 
+            if env_id in {"PD", "SUB"}:
+                constraint_fns = env_instance.build_constraint_fns(problem.constraints)
+                episode_state_dict["eval_pool"] = env_instance.build_evaluation_pool(
+                    constraints=constraint_fns,
+                    catalog=list(state.products_by_id.values()),
+                    k_eval=int(self.config.get("K_eval", 500)),
+                )
+
+            if env_id == "SUB":
+                def _embedding_for_product(product_id: str) -> np.ndarray | None:
+                    product = state.products_by_id.get(product_id)
+                    if product is None:
+                        return None
+
+                    if (
+                        state.catalog_state is not None
+                        and state.catalog_state.vector_index is not None
+                    ):
+                        embedding = state.catalog_state.vector_index.get_embedding(product_id)
+                        if embedding is not None:
+                            return embedding
+
+                    if (
+                        state.catalog_state is not None
+                        and state.catalog_state.embedding_engine is not None
+                    ):
+                        return state.catalog_state.embedding_engine.encode_product(product)
+
+                    return None
+
+                episode_state_dict["embeddings_fn"] = _embedding_for_product
+
             result: EpisodeResult = env_instance.verify(
                 answer=answer_dict,
                 params=problem,

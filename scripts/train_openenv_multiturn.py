@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -126,6 +127,9 @@ class EcomRLVEMultiTurnEnv:
         self.env_id = ""
         self.episode_seed = 0
         self.invalid_tool = False
+        self.is_correct = False
+        self.termination_reason = ""
+        self.reward_breakdown: dict[str, Any] = {}
         self.debug_enabled = _DEBUG_ROLLOUT_COUNT < int(_FACTORY_CONFIG["debug_rollouts"])
         self.debug_id = _DEBUG_ROLLOUT_COUNT
         _DEBUG_ROLLOUT_COUNT += 1
@@ -139,6 +143,9 @@ class EcomRLVEMultiTurnEnv:
         self.reward = 0.0
         self.done = False
         self.invalid_tool = False
+        self.is_correct = False
+        self.termination_reason = ""
+        self.reward_breakdown = {}
 
         env_id = kwargs.get("env_id") or _FACTORY_CONFIG.get("env_id")
         difficulty = kwargs.get("difficulty")
@@ -580,12 +587,15 @@ class EcomRLVEMultiTurnEnv:
         _obs, reward, done, info = self.env.step(json.dumps(action))
         self.done = done
         self.reward = -1.0 if self.invalid_tool else float(reward)
+        self.is_correct = bool(info.get("is_correct", False))
+        self.termination_reason = str(info.get("termination_reason") or "")
+        self.reward_breakdown = info.get("reward_breakdown", {})
         summary = {
             "reward": self.reward,
             "done": self.done,
-            "is_correct": info.get("is_correct", False),
-            "termination_reason": info.get("termination_reason"),
-            "reward_breakdown": info.get("reward_breakdown", {}),
+            "is_correct": self.is_correct,
+            "termination_reason": self.termination_reason,
+            "reward_breakdown": self.reward_breakdown,
         }
         self._debug(
             "finish message=%s answer=%s summary=%s",
@@ -641,9 +651,22 @@ def reward_func(
         env.ensure_finished()
         rewards.append(float(env.reward))
     if any(env.debug_enabled for env in environments):
+        mean_reward = sum(rewards) / max(len(rewards), 1)
+        reward_std = (
+            sum((reward - mean_reward) ** 2 for reward in rewards) / max(len(rewards), 1)
+        ) ** 0.5
+        env_counts = Counter(env.env_id for env in environments)
+        reason_counts = Counter(env.termination_reason or "unknown" for env in environments)
+        correct_count = sum(1 for env in environments if env.is_correct)
         logger.info(
-            "[reward_func] rewards=%s",
+            "[reward_func] rewards=%s mean=%.4f std=%.4f correct=%d/%d envs=%s reasons=%s",
             json.dumps([round(float(r), 4) for r in rewards]),
+            mean_reward,
+            reward_std,
+            correct_count,
+            len(environments),
+            json.dumps(dict(sorted(env_counts.items()))),
+            json.dumps(dict(sorted(reason_counts.items()))),
         )
     return rewards
 
