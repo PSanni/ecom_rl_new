@@ -86,8 +86,11 @@ _FACTORY_CONFIG: dict[str, Any] = {
     "config": {"disclose_env_id": True, "disclose_difficulty": True},
     "debug_rollouts": 0,
     "debug_result_chars": 1200,
+    "trace_rollouts_dir": "",
+    "trace_rollouts_limit": 0,
 }
 _DEBUG_ROLLOUT_COUNT = 0
+_TRACE_ROLLOUT_COUNT = 0
 
 
 def _json_loads_or_default(value: str | None, default: Any) -> Any:
@@ -115,6 +118,115 @@ def _trim_result(result: Any, limit: int = 6000) -> str:
     if len(text) > limit:
         return text[:limit] + "\n... <truncated>"
     return text
+
+
+def _jsonable(value: Any) -> Any:
+    """Convert trainer/env payloads into JSON-safe values."""
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "shape"):
+        return {
+            "type": type(value).__name__,
+            "shape": list(value.shape),
+            "dtype": str(getattr(value, "dtype", "")),
+        }
+    return str(value)
+
+
+def _select_rollout_item(value: Any, index: int, total: int) -> Any:
+    """Select one rollout's value from a batched TRL reward payload."""
+    if isinstance(value, (list, tuple)) and len(value) == total:
+        return value[index]
+    if hasattr(value, "shape") and getattr(value, "shape", None):
+        try:
+            if len(value.shape) > 0 and value.shape[0] == total:
+                return value[index]
+        except Exception:
+            return value
+    return value
+
+
+def _dump_rollout_trace(
+    env: "EcomRLVEMultiTurnEnv",
+    rollout_index: int,
+    total_rollouts: int,
+    reward_kwargs: dict[str, Any],
+) -> None:
+    """Persist a full rollout trace for post-hoc GRPO debugging."""
+    global _TRACE_ROLLOUT_COUNT
+
+    trace_dir = str(_FACTORY_CONFIG.get("trace_rollouts_dir") or "")
+    if not trace_dir:
+        return
+
+    limit = int(_FACTORY_CONFIG.get("trace_rollouts_limit") or 0)
+    if limit > 0 and _TRACE_ROLLOUT_COUNT >= limit:
+        return
+
+    trace_id = _TRACE_ROLLOUT_COUNT
+    _TRACE_ROLLOUT_COUNT += 1
+
+    state = env.env.get_episode_state()
+    tool_history = state.tool_results_history if state is not None else []
+    tool_counts = Counter(str(entry.get("name", "")) for entry in tool_history)
+    tool_duration_ms = sum(
+        float(entry.get("duration_ms") or 0.0)
+        for entry in tool_history
+    )
+
+    trainer_payload: dict[str, Any] = {}
+    for key, value in reward_kwargs.items():
+        selected = _select_rollout_item(value, rollout_index, total_rollouts)
+        trainer_payload[key] = _jsonable(selected)
+
+    trace = env.env.get_episode_trace()
+    trace["wrapper"] = {
+        "debug_id": env.debug_id,
+        "invalid_tool": env.invalid_tool,
+        "is_correct": env.is_correct,
+        "termination_reason": env.termination_reason,
+        "reward": env.reward,
+        "tool_count": len(tool_history),
+        "tool_counts": dict(sorted(tool_counts.items())),
+        "tool_duration_ms": tool_duration_ms,
+    }
+    trace["trl"] = {
+        "trace_id": trace_id,
+        "pid": os.getpid(),
+        "rollout_index": rollout_index,
+        "rollouts_in_reward_call": total_rollouts,
+        "payload": trainer_payload,
+    }
+
+    out_dir = Path(trace_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    env_id = env.env_id or trace.get("env_id") or "env"
+    seed = env.episode_seed or trace.get("seed") or 0
+    filename = f"rollout_{os.getpid()}_{trace_id:06d}_{env_id}_s{seed}.json"
+    filepath = out_dir / filename
+    with open(filepath, "w") as f:
+        json.dump(trace, f, indent=2, default=str)
+
+    summary = {
+        "trace_id": trace_id,
+        "path": str(filepath),
+        "env_id": env_id,
+        "seed": seed,
+        "reward": env.reward,
+        "is_correct": env.is_correct,
+        "termination_reason": env.termination_reason,
+        "turns": trace.get("turn"),
+        "tool_count": len(tool_history),
+        "tool_counts": dict(sorted(tool_counts.items())),
+    }
+    with open(out_dir / "summary.jsonl", "a") as f:
+        f.write(json.dumps(summary, default=str) + "\n")
 
 
 class EcomRLVEMultiTurnEnv:
@@ -658,9 +770,15 @@ def reward_func(
                 debug_kwargs[key] = type(value).__name__
         logger.info("[reward_func] kwargs=%s", json.dumps(debug_kwargs, default=str))
     rewards = []
-    for env in environments:
+    for rollout_index, env in enumerate(environments):
         env.ensure_finished()
         rewards.append(float(env.reward))
+        _dump_rollout_trace(
+            env=env,
+            rollout_index=rollout_index,
+            total_rollouts=len(environments),
+            reward_kwargs=kwargs,
+        )
     if any(env.debug_enabled for env in environments):
         mean_reward = sum(rewards) / max(len(rewards), 1)
         reward_std = (
@@ -847,6 +965,45 @@ def parse_args() -> argparse.Namespace:
         default=1200,
         help="Maximum characters per debug tool result/reward payload.",
     )
+    parser.add_argument(
+        "--trace_rollouts_dir",
+        type=str,
+        default="",
+        help=(
+            "Optional directory to save full GRPO rollout traces as JSON files. "
+            "Each trace includes env state, tool history, reward breakdown, and "
+            "TRL reward payload such as completions when provided."
+        ),
+    )
+    parser.add_argument(
+        "--trace_rollouts_limit",
+        type=int,
+        default=0,
+        help="Maximum number of rollout traces to save. Use 0 for unlimited.",
+    )
+    parser.add_argument(
+        "--use_transformers_continuous_batching",
+        type=_bool_arg,
+        default=None,
+        metavar="true|false",
+        help=(
+            "Enable TRL/Transformers continuous batching for generation when "
+            "the installed TRL GRPOConfig supports it."
+        ),
+    )
+    parser.add_argument(
+        "--transformers_cb_max_memory_percent",
+        type=float,
+        default=None,
+        help="Optional max_memory_percent for transformers continuous batching.",
+    )
+    parser.add_argument(
+        "--transformers_cb_use_cuda_graph",
+        type=_bool_arg,
+        default=None,
+        metavar="true|false",
+        help="Optional use_cuda_graph value for transformers continuous batching.",
+    )
     return parser.parse_args()
 
 
@@ -885,6 +1042,8 @@ def main() -> None:
         "config": env_config,
         "debug_rollouts": args.debug_rollouts,
         "debug_result_chars": args.debug_result_chars,
+        "trace_rollouts_dir": args.trace_rollouts_dir,
+        "trace_rollouts_limit": args.trace_rollouts_limit,
     })
 
     load_in_4bit = args.load_in_4bit and not args.load_in_16bit
@@ -979,13 +1138,41 @@ def main() -> None:
             "Installed TRL GRPOConfig does not support chat_template_kwargs; "
             "cannot pass enable_thinking=False."
         )
+
+    if args.use_transformers_continuous_batching is not None:
+        key = "use_transformers_continuous_batching"
+        if key in grpo_config_params:
+            config_kwargs[key] = args.use_transformers_continuous_batching
+        else:
+            logger.warning(
+                "Installed TRL GRPOConfig does not support %s; ignoring request.",
+                key,
+            )
+
+    transformers_cb_config: dict[str, Any] = {}
+    if args.transformers_cb_max_memory_percent is not None:
+        transformers_cb_config["max_memory_percent"] = args.transformers_cb_max_memory_percent
+    if args.transformers_cb_use_cuda_graph is not None:
+        transformers_cb_config["use_cuda_graph"] = args.transformers_cb_use_cuda_graph
+    if transformers_cb_config:
+        key = "transformers_continuous_batching_config"
+        if key in grpo_config_params:
+            config_kwargs[key] = transformers_cb_config
+        else:
+            logger.warning(
+                "Installed TRL GRPOConfig does not support %s; ignoring request.",
+                key,
+            )
+
     logger.info(
-        "Generation: temperature=%s top_p=%s top_k=%s min_p=%s thinking=%s",
+        "Generation: temperature=%s top_p=%s top_k=%s min_p=%s thinking=%s "
+        "transformers_continuous_batching=%s",
         args.temperature,
         args.top_p,
         args.top_k,
         args.min_p,
         "enabled" if thinking_enabled else "disabled",
+        config_kwargs.get("use_transformers_continuous_batching", "<default>"),
     )
 
     per_device_train_batch_size = max(args.batch_size, args.num_generations)
