@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -198,6 +199,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--faiss_index_path", type=str, default=None)
     parser.add_argument("--debug_result_chars", type=int, default=1200)
     parser.add_argument(
+        "--debug_prompt_chars",
+        type=int,
+        default=0,
+        help="Print the last N characters of the rendered chat-template prompt before generation.",
+    )
+    parser.add_argument(
+        "--trace_file",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSONL file for inference debug events. Defaults to "
+            "<adapter-or-model-dir>/inference_traces/<timestamp>.jsonl when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--trace_full_prompt",
+        type=_bool_arg,
+        default=False,
+        metavar="true|false",
+        help="Store full rendered prompts in --trace_file. Defaults to false.",
+    )
+    parser.add_argument(
         "--force_finish_on_max_rounds",
         type=_bool_arg,
         default=True,
@@ -235,6 +258,16 @@ def _render_prompt(
         return tokenizer.apply_chat_template(messages, **kwargs)
 
 
+def _write_trace(trace_file: str | None, event: dict[str, Any]) -> None:
+    if not trace_file:
+        return
+    path = Path(trace_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {"time": time.time(), **event}
+    with path.open("a") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+
+
 def _stream_generate(
     model: Any,
     tokenizer: Any,
@@ -251,6 +284,19 @@ def _stream_generate(
         disable_thinking=args.disable_thinking,
         include_tools=args.chat_template_tools,
     )
+    _write_trace(args.trace_file, {
+        "event": "rendered_prompt",
+        "message_count": len(messages),
+        "prompt_chars": len(prompt),
+        "prompt_tail": prompt[-4000:],
+        "prompt": prompt if args.trace_full_prompt else None,
+    })
+    if args.debug_prompt_chars > 0:
+        print("\n" + "=" * 80)
+        print("RENDERED PROMPT TAIL")
+        print("=" * 80)
+        print(prompt[-args.debug_prompt_chars:])
+        print("=" * 80)
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
@@ -285,7 +331,13 @@ def _stream_generate(
         chunks.append(text)
     thread.join()
     print("", flush=True)
-    return "".join(chunks)
+    completion = "".join(chunks)
+    _write_trace(args.trace_file, {
+        "event": "model_completion",
+        "completion": completion,
+        "completion_chars": len(completion),
+    })
+    return completion
 
 
 def _strip_thinking(text: str) -> str:
@@ -406,11 +458,8 @@ def _assistant_message_with_tool_calls(
         "content": content,
         "tool_calls": [
             {
-                "type": "function",
-                "function": {
-                    "name": call["name"],
-                    "arguments": json.dumps(call["args"], default=str),
-                },
+                "name": call["name"],
+                "arguments": call["args"],
             }
             for call in calls
         ],
@@ -494,6 +543,18 @@ def _print_reward(env: EcomRLVEMultiTurnEnv) -> None:
     }, indent=2, default=str))
 
 
+def _final_reward_payload(env: EcomRLVEMultiTurnEnv) -> dict[str, Any]:
+    return {
+        "reward": env.reward,
+        "done": env.done,
+        "is_correct": env.is_correct,
+        "termination_reason": env.termination_reason,
+        "finish_called_by_model": env.finish_called_by_model,
+        "fallback_finished": env.fallback_finished,
+        "reward_breakdown": env.reward_breakdown,
+    }
+
+
 def _read_customer_message() -> str:
     while True:
         try:
@@ -537,11 +598,28 @@ def _run_assistant_turn(
     print("\nAssistant> ", end="", flush=True)
     completion = _stream_generate(model, tokenizer, messages, tools, args)
     calls = parse_tool_calls(completion, allowed_names)
+    _write_trace(args.trace_file, {
+        "event": "assistant_turn",
+        "round_index": round_index,
+        "completion": completion,
+        "parsed_tool_calls": calls,
+        "message_count_before_append": len(messages),
+    })
     if not calls:
         messages.append({"role": "assistant", "content": _strip_thinking(completion)})
+        _write_trace(args.trace_file, {
+            "event": "assistant_message_appended",
+            "round_index": round_index,
+            "message": messages[-1],
+        })
         return False
 
     messages.append(_assistant_message_with_tool_calls(completion, calls))
+    _write_trace(args.trace_file, {
+        "event": "assistant_tool_calls_appended",
+        "round_index": round_index,
+        "message": messages[-1],
+    })
 
     for call in calls:
         name = call["name"]
@@ -556,6 +634,22 @@ def _run_assistant_turn(
         print("Tool result:")
         print(result)
         messages.append({"role": "tool", "name": name, "content": result})
+        state = env.env.get_episode_state()
+        _write_trace(args.trace_file, {
+            "event": "tool_result",
+            "round_index": round_index,
+            "tool_call": call,
+            "tool_result": result,
+            "env_done": env.done,
+            "env_reward": env.reward,
+            "message": messages[-1],
+            "seen_product_ids": (
+                sorted(state.seen_product_ids) if state is not None else []
+            ),
+            "tool_results_history_count": (
+                len(state.tool_results_history) if state is not None else 0
+            ),
+        })
         if env.done:
             return True
 
@@ -611,6 +705,16 @@ def main() -> None:
         args.chat_template_tools,
     )
     logger.info("Environment config: %s", json.dumps(env_config, default=str))
+    if args.trace_file is None:
+        trace_base = Path(args.adapter or args.model.replace("/", "_"))
+        if trace_base.suffix:
+            trace_base = trace_base.parent
+        args.trace_file = str(
+            trace_base
+            / "inference_traces"
+            / f"{int(time.time())}_{args.env_id.lower()}_{args.seed}.jsonl"
+        )
+    logger.info("Inference trace file: %s", args.trace_file)
     model, tokenizer = _load_model_and_tokenizer(args)
 
     env = EcomRLVEMultiTurnEnv()
@@ -619,6 +723,23 @@ def main() -> None:
         difficulty=args.difficulty,
         episode_seed=args.seed,
     )
+    _write_trace(args.trace_file, {
+        "event": "env_reset",
+        "env_id": env.env_id,
+        "episode_seed": env.episode_seed,
+        "reset_observation": reset_observation,
+        "env_config": env_config,
+        "generation": {
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "min_p": args.min_p,
+            "max_new_tokens": args.max_new_tokens,
+            "max_seq_length": args.max_seq_length,
+            "disable_thinking": args.disable_thinking,
+            "chat_template_tools": args.chat_template_tools,
+        },
+    })
     tools = _tool_functions(env, args.env_id)
     allowed_names = {tool.__name__ for tool in tools}
 
@@ -644,6 +765,12 @@ def main() -> None:
             "content": TRAINING_USER_STARTER + visible_observation,
         },
     ]
+    _write_trace(args.trace_file, {
+        "event": "customer_message",
+        "message": customer_message,
+        "visible_observation": visible_observation,
+        "messages": messages,
+    })
 
     round_index = 0
     while not env.done and round_index < args.max_tool_rounds:
@@ -659,6 +786,10 @@ def main() -> None:
             round_index=round_index,
         )
         if env.done:
+            _write_trace(args.trace_file, {
+                "event": "final_reward",
+                **_final_reward_payload(env),
+            })
             _print_reward(env)
             return
         if called_tool:
@@ -668,10 +799,19 @@ def main() -> None:
         if not customer_message:
             break
         messages.append({"role": "user", "content": customer_message})
+        _write_trace(args.trace_file, {
+            "event": "customer_message",
+            "message": customer_message,
+            "messages_count": len(messages),
+        })
 
     if not env.done and args.force_finish_on_max_rounds:
         print("\nModel did not call finish before chat ended; applying fallback scoring.")
         env.ensure_finished()
+    _write_trace(args.trace_file, {
+        "event": "final_reward",
+        **_final_reward_payload(env),
+    })
     _print_reward(env)
 
 
