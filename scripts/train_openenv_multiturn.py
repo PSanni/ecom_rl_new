@@ -815,6 +815,13 @@ def parse_args() -> argparse.Namespace:
         help="Optional FAISS index factory when real embeddings are enabled.",
     )
     parser.add_argument(
+        "--faiss_use_gpu",
+        type=_bool_arg,
+        default=None,
+        metavar="true|false",
+        help="Move FAISS index to GPU when the installed FAISS package supports it.",
+    )
+    parser.add_argument(
         "--faiss_index_path",
         type=str,
         default=None,
@@ -862,6 +869,7 @@ def main() -> None:
         "embedding_device": args.embedding_device,
         "n_synthetic_products": args.n_synthetic_products,
         "faiss_index_factory": args.faiss_index_factory,
+        "faiss_use_gpu": args.faiss_use_gpu,
         "faiss_index_path": args.faiss_index_path,
     }
     env_config.update({

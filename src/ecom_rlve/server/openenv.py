@@ -272,13 +272,18 @@ class EcomRLVEEnv:
         if faiss_index_path is not None:
             # Load pre-built index from disk (skips expensive re-encoding)
             try:
+                use_gpu = bool(self.config.get("faiss_use_gpu", False))
                 self._vector_index = VectorIndex(
                     dim=self._embedding_engine.dim,
+                    use_gpu=use_gpu,
                 )
                 self._vector_index.load_from_dir(faiss_index_path)
                 logger.info(
-                    "EcomRLVEEnv: loaded pre-built FAISS index from %s (%d vectors)",
-                    faiss_index_path, len(self._vector_index),
+                    "EcomRLVEEnv: loaded pre-built FAISS index from %s "
+                    "(%d vectors, use_gpu=%s)",
+                    faiss_index_path,
+                    len(self._vector_index),
+                    use_gpu,
                 )
 
                 # If the index covers more products than loaded, restrict
@@ -298,13 +303,17 @@ class EcomRLVEEnv:
             # Build new index at runtime (encodes all products)
             try:
                 index_factory = self.config.get("faiss_index_factory", "Flat")
+                use_gpu = bool(self.config.get("faiss_use_gpu", False))
                 self._vector_index = VectorIndex(
                     dim=self._embedding_engine.dim,
                     index_factory=index_factory,
+                    use_gpu=use_gpu,
                 )
                 logger.info(
-                    "EcomRLVEEnv: using FAISS VectorIndex (factory='%s')",
+                    "EcomRLVEEnv: using FAISS VectorIndex "
+                    "(factory='%s', use_gpu=%s)",
                     index_factory,
+                    use_gpu,
                 )
             except ImportError:
                 logger.warning(
