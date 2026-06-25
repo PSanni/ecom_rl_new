@@ -47,34 +47,99 @@ logging.basicConfig(
 logger = logging.getLogger("ecomrlve.train_openenv_multiturn")
 
 
-SYSTEM_PROMPT = """\
-You are a helpful e-commerce shopping assistant. Your goal is to help \
-customers find products, manage orders, handle returns, and answer \
-policy questions.
+_BASE_ASSISTANT_INSTRUCTIONS = """\
+You are a helpful e-commerce shopping assistant. Help the customer complete
+their shopping request using tools when needed.
 
-You can use the following tools:
-- catalog.search(query, filters, top_k): Search the product catalog
-- catalog.rerank(query, candidate_product_ids, top_k): Re-rank products
-- catalog.get_product(product_id): Get full product details
-- catalog.get_variants(product_id): Get product variants
-- cart.add(product_id, variant_id, qty): Add item to cart
-- cart.remove(line_id): Remove item from cart
-- cart.view(): View current cart
-- order.list(days): List recent orders
-- order.get_status(order_id): Get order status
-- order.checkout(shipping_address_id, payment_method_id): Checkout
-- return.initiate(order_id, line_id, reason): Initiate a return
-- policy.search(query, top_k): Search policy knowledge base
+Use the Python tool names exactly as shown below. After using tools, do not
+end with plain assistant text. You must call finish(...) to submit the final
+result.
+"""
 
-In this tool-calling interface, use the available Python tool names that
-correspond to the tool names above, for example catalog_search for
-catalog.search, catalog_rerank for catalog.rerank, cart_add for cart.add, and
-policy_search for policy.search.
 
-When you have found the answer, call the finish tool. Do not write the final
-answer as plain assistant text after tool results. For product recommendations,
-call finish with recommended_product_ids_json set to a JSON list of product IDs
-returned by tools.
+_FINISH_INSTRUCTIONS = """\
+Finalization:
+- When you are ready to answer, call finish(...).
+- For product recommendations, pass product IDs returned by catalog_search or
+  catalog_rerank in recommended_product_ids_json as a JSON list string.
+- The final assistant_message should be brief and customer-facing.
+"""
+
+
+_ENV_TOOL_PROMPTS: dict[str, str] = {
+    "PD": """\
+Available tools for product discovery:
+- catalog_search(query, filters, top_k): Search the product catalog.
+- catalog_rerank(query, candidate_product_ids_json, top_k): Re-rank candidate product IDs.
+- catalog_get_product(product_id): Get full product details.
+- catalog_get_variants(product_id): Get variants for a product.
+- finish(assistant_message, recommended_product_ids_json): Submit final recommendations.
+""",
+    "SUB": """\
+Available tools for finding substitutions:
+- catalog_search(query, filters, top_k): Search the product catalog.
+- catalog_rerank(query, candidate_product_ids_json, top_k): Re-rank candidate product IDs.
+- catalog_get_product(product_id): Get full product details.
+- catalog_get_variants(product_id): Get variants for a product.
+- finish(assistant_message, recommended_product_ids_json): Submit final substitutions.
+""",
+    "CART": """\
+Available tools for cart building:
+- user_get_visit_history(): Get recently viewed products when helpful.
+- catalog_search(query, filters, top_k): Search the product catalog.
+- catalog_get_product(product_id): Get full product details.
+- catalog_get_variants(product_id): Get variants for a product.
+- cart_add(product_id, variant_id, quantity): Add a product to the cart.
+- cart_view(): View current cart contents.
+- cart_remove(line_id): Remove a cart line.
+- cart_set_quantity(line_id, quantity): Change a cart quantity.
+- finish(assistant_message): Submit the final cart result.
+""",
+    "RETURN": """\
+Available tools for returns:
+- order_list(days): List recent orders.
+- order_get_status(order_id): Get order details/status.
+- return_check_eligibility(order_id, line_id): Check return eligibility.
+- return_initiate(order_id, line_id, reason_code, method): Start a return.
+- return_exchange(order_id, line_id, new_product_id, new_variant_id): Start an exchange.
+- catalog_search(query, filters, top_k): Search for replacement products when needed.
+- finish(assistant_message, selected_order_id, selected_line_id): Submit the final return result.
+""",
+    "STATUS": """\
+Available tools for order status:
+- order_list(days): List recent orders.
+- order_get_status(order_id): Get order status.
+- finish(assistant_message, selected_order_id): Submit the final status answer.
+""",
+    "POLICY": """\
+Available tools for policy questions:
+- policy_search(query, top_k): Search store policy.
+- datetime_now(): Get the current date/time if policy timing matters.
+- finish(assistant_message, policy_answer): Submit the final policy answer.
+""",
+}
+
+
+_GENERIC_TOOL_PROMPT = """\
+Available tools:
+- catalog_search(query, filters, top_k)
+- catalog_rerank(query, candidate_product_ids_json, top_k)
+- catalog_get_product(product_id)
+- catalog_get_variants(product_id)
+- user_get_visit_history()
+- cart_add(product_id, variant_id, quantity)
+- cart_view()
+- cart_remove(line_id)
+- cart_set_quantity(line_id, quantity)
+- order_list(days)
+- order_get_status(order_id)
+- order_checkout(shipping_address_id, payment_method_id)
+- return_check_eligibility(order_id, line_id)
+- return_initiate(order_id, line_id, reason_code, method)
+- return_exchange(order_id, line_id, new_product_id, new_variant_id)
+- policy_search(query, top_k)
+- datetime_now()
+- finish(...)
 """
 
 
@@ -88,6 +153,7 @@ _FACTORY_CONFIG: dict[str, Any] = {
     "debug_result_chars": 1200,
     "trace_rollouts_dir": None,
     "trace_rollouts_limit": 0,
+    "fallback_finish_reward": 0.0,
 }
 _DEBUG_ROLLOUT_COUNT = 0
 _TRACE_ROLLOUT_COUNT = 0
@@ -118,6 +184,15 @@ def _trim_result(result: Any, limit: int = 6000) -> str:
     if len(text) > limit:
         return text[:limit] + "\n... <truncated>"
     return text
+
+
+def _system_prompt_for_env(env_id: str | None) -> str:
+    tool_prompt = _ENV_TOOL_PROMPTS.get(env_id or "", _GENERIC_TOOL_PROMPT)
+    return "\n\n".join([
+        _BASE_ASSISTANT_INSTRUCTIONS.strip(),
+        tool_prompt.strip(),
+        _FINISH_INSTRUCTIONS.strip(),
+    ]) + "\n"
 
 
 def _jsonable(value: Any) -> Any:
@@ -191,6 +266,8 @@ def _dump_rollout_trace(
         "invalid_tool": env.invalid_tool,
         "is_correct": env.is_correct,
         "termination_reason": env.termination_reason,
+        "finish_called_by_model": env.finish_called_by_model,
+        "fallback_finished": env.fallback_finished,
         "reward": env.reward,
         "tool_count": len(tool_history),
         "tool_counts": dict(sorted(tool_counts.items())),
@@ -221,6 +298,8 @@ def _dump_rollout_trace(
         "reward": env.reward,
         "is_correct": env.is_correct,
         "termination_reason": env.termination_reason,
+        "finish_called_by_model": env.finish_called_by_model,
+        "fallback_finished": env.fallback_finished,
         "turns": trace.get("turn"),
         "tool_count": len(tool_history),
         "tool_counts": dict(sorted(tool_counts.items())),
@@ -253,6 +332,8 @@ class EcomRLVEMultiTurnEnv:
         self.is_correct = False
         self.termination_reason = ""
         self.reward_breakdown: dict[str, Any] = {}
+        self.finish_called_by_model = False
+        self.fallback_finished = False
         self.debug_enabled = _DEBUG_ROLLOUT_COUNT < int(_FACTORY_CONFIG["debug_rollouts"])
         self.debug_id = _DEBUG_ROLLOUT_COUNT
         _DEBUG_ROLLOUT_COUNT += 1
@@ -269,6 +350,8 @@ class EcomRLVEMultiTurnEnv:
         self.is_correct = False
         self.termination_reason = ""
         self.reward_breakdown = {}
+        self.finish_called_by_model = False
+        self.fallback_finished = False
 
         env_id = kwargs.get("env_id") or _FACTORY_CONFIG.get("env_id")
         difficulty = kwargs.get("difficulty")
@@ -688,6 +771,28 @@ class EcomRLVEMultiTurnEnv:
         Returns:
             Final reward and reward breakdown.
         """
+        return self._finish(
+            assistant_message=assistant_message,
+            recommended_product_ids_json=recommended_product_ids_json,
+            selected_order_id=selected_order_id,
+            selected_line_id=selected_line_id,
+            policy_answer=policy_answer,
+            from_fallback=False,
+        )
+
+    def _finish(
+        self,
+        assistant_message: str,
+        recommended_product_ids_json: str = "[]",
+        selected_order_id: str = "",
+        selected_line_id: str = "",
+        policy_answer: str = "",
+        *,
+        from_fallback: bool,
+    ) -> str:
+        """Submit the terminal answer, marking whether it was fallback-forced."""
+        self.finish_called_by_model = not from_fallback
+        self.fallback_finished = from_fallback
         answer: dict[str, Any] = {
             "env": self.env_id,
             "recommended_product_ids": _json_loads_or_default(
@@ -713,15 +818,30 @@ class EcomRLVEMultiTurnEnv:
         self.is_correct = bool(info.get("is_correct", False))
         self.termination_reason = str(info.get("termination_reason") or "")
         self.reward_breakdown = info.get("reward_breakdown", {})
+        if from_fallback and not self.invalid_tool:
+            self.reward = float(_FACTORY_CONFIG["fallback_finish_reward"])
+            self.termination_reason = "missing_finish"
+            if isinstance(self.reward_breakdown, dict):
+                self.reward_breakdown = dict(self.reward_breakdown)
+                self.reward_breakdown["r_total"] = self.reward
+                self.reward_breakdown["fallback_finish_reward"] = self.reward
+                self.reward_breakdown["original_r_total"] = float(reward)
+                details = self.reward_breakdown.setdefault("details", {})
+                if isinstance(details, dict):
+                    details["fallback_finished"] = True
+                    details["original_r_total"] = float(reward)
         summary = {
             "reward": self.reward,
             "done": self.done,
             "is_correct": self.is_correct,
             "termination_reason": self.termination_reason,
+            "finish_called_by_model": self.finish_called_by_model,
+            "fallback_finished": self.fallback_finished,
             "reward_breakdown": self.reward_breakdown,
         }
         self._debug(
-            "finish message=%s answer=%s summary=%s",
+            "finish from_fallback=%s message=%s answer=%s summary=%s",
+            from_fallback,
             assistant_message[:300],
             json.dumps(answer, default=str),
             _trim_result(summary, limit=int(_FACTORY_CONFIG["debug_result_chars"])),
@@ -741,9 +861,10 @@ class EcomRLVEMultiTurnEnv:
             json.dumps(seen_product_ids),
             _trim_result(tool_history, limit=int(_FACTORY_CONFIG["debug_result_chars"])),
         )
-        self.finish(
+        self._finish(
             assistant_message="I have completed the task.",
             recommended_product_ids_json=json.dumps(seen_product_ids),
+            from_fallback=True,
         )
 
 
@@ -810,13 +931,13 @@ def build_dataset(n_prompts: int, collection: str, env_id: str | None) -> "Datas
         eid = env_ids[i % len(env_ids)]
         rows.append({
             "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": _system_prompt_for_env(eid)},
                 {
                     "role": "user",
                     "content": (
-                        "Start the e-commerce task. Read the environment "
-                        "observation, use tools as needed, and call finish "
-                        "when the task is complete."
+                        "A customer has started a shopping conversation. Help "
+                        "them using the available tools when needed, then call "
+                        "finish with the final result.\n\n"
                     ),
                 },
             ],
@@ -981,6 +1102,16 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of rollout traces to save. Use 0 for unlimited.",
     )
     parser.add_argument(
+        "--fallback_finish_reward",
+        type=float,
+        default=0.0,
+        help=(
+            "Reward assigned when TRL ends a rollout before the model calls "
+            "finish(...). Defaults to 0.0 so unfinished/plain-text rollouts "
+            "receive no positive credit."
+        ),
+    )
+    parser.add_argument(
         "--use_transformers_continuous_batching",
         type=_bool_arg,
         default=None,
@@ -1049,6 +1180,7 @@ def main() -> None:
         "debug_result_chars": args.debug_result_chars,
         "trace_rollouts_dir": trace_rollouts_dir,
         "trace_rollouts_limit": args.trace_rollouts_limit,
+        "fallback_finish_reward": args.fallback_finish_reward,
     })
 
     load_in_4bit = args.load_in_4bit and not args.load_in_16bit

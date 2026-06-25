@@ -315,7 +315,7 @@ def verify_cart(
     r_task = 2.0 * f1 - 1.0
     r_task = float(np.clip(r_task, -1.0, 1.0))
 
-    is_correct = abs(f1 - 1.0) < 1e-9
+    is_correct = f1 >= 1.0 - 1e-6
 
     return r_task, is_correct
 
