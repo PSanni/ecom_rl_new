@@ -86,7 +86,7 @@ _FACTORY_CONFIG: dict[str, Any] = {
     "config": {"disclose_env_id": True, "disclose_difficulty": True},
     "debug_rollouts": 0,
     "debug_result_chars": 1200,
-    "trace_rollouts_dir": "",
+    "trace_rollouts_dir": None,
     "trace_rollouts_limit": 0,
 }
 _DEBUG_ROLLOUT_COUNT = 0
@@ -968,11 +968,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--trace_rollouts_dir",
         type=str,
-        default="",
+        default=None,
         help=(
-            "Optional directory to save full GRPO rollout traces as JSON files. "
-            "Each trace includes env state, tool history, reward breakdown, and "
-            "TRL reward payload such as completions when provided."
+            "Directory to save full GRPO rollout traces as JSON files. Defaults "
+            "to <output_dir>/traces. Pass an empty string to disable tracing."
         ),
     )
     parser.add_argument(
@@ -1035,6 +1034,12 @@ def main() -> None:
         if value is not None
     })
 
+    trace_rollouts_dir = (
+        os.path.join(args.output_dir, "traces")
+        if args.trace_rollouts_dir is None
+        else args.trace_rollouts_dir
+    )
+
     _FACTORY_CONFIG.update({
         "collection": args.collection,
         "seed": args.seed,
@@ -1042,7 +1047,7 @@ def main() -> None:
         "config": env_config,
         "debug_rollouts": args.debug_rollouts,
         "debug_result_chars": args.debug_result_chars,
-        "trace_rollouts_dir": args.trace_rollouts_dir,
+        "trace_rollouts_dir": trace_rollouts_dir,
         "trace_rollouts_limit": args.trace_rollouts_limit,
     })
 
