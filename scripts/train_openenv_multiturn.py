@@ -159,12 +159,14 @@ _DEBUG_ROLLOUT_COUNT = 0
 _TRACE_ROLLOUT_COUNT = 0
 
 
-def _json_loads_or_default(value: str | None, default: Any) -> Any:
+def _json_loads_or_default(value: Any, default: Any) -> Any:
     if value is None or value == "":
         return default
+    if not isinstance(value, str):
+        return value
     try:
         return json.loads(value)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         return default
 
 

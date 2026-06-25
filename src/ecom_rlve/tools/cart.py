@@ -220,6 +220,27 @@ def _get_products_by_id(state: Any) -> dict[str, Any]:
     )
 
 
+def _get_variants_by_product(state: Any) -> dict[str, list[Any]]:
+    """Extract variants_by_product mapping from the episode state when present."""
+    if hasattr(state, "variants_by_product"):
+        return state.variants_by_product
+
+    if isinstance(state, dict) and "variants_by_product" in state:
+        return state["variants_by_product"]
+
+    if hasattr(state, "catalog_state") and hasattr(state.catalog_state, "variants_by_product"):
+        return state.catalog_state.variants_by_product
+
+    if (
+        isinstance(state, dict)
+        and "catalog_state" in state
+        and hasattr(state["catalog_state"], "variants_by_product")
+    ):
+        return state["catalog_state"].variants_by_product
+
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Tool handler: cart.view
 # ---------------------------------------------------------------------------
@@ -291,6 +312,25 @@ def cart_add(
             f"Insufficient stock for product '{product_id}': "
             f"requested {quantity}, available {stock_qty}"
         )
+
+    variants_by_product = _get_variants_by_product(state)
+    product_variants = variants_by_product.get(product_id, [])
+    if variant_id is not None and product_variants:
+        valid_variant_ids: set[str] = set()
+        for variant in product_variants:
+            if hasattr(variant, "variant_id"):
+                valid_variant_ids.add(variant.variant_id)
+            elif hasattr(variant, "id"):
+                valid_variant_ids.add(variant.id)
+            elif isinstance(variant, dict):
+                raw_id = variant.get("variant_id") or variant.get("id")
+                if raw_id is not None:
+                    valid_variant_ids.add(str(raw_id))
+        if variant_id not in valid_variant_ids:
+            raise ValueError(
+                f"Variant '{variant_id}' is not valid for product '{product_id}'. "
+                f"Use one of: {sorted(valid_variant_ids)}"
+            )
 
     before = cart._snapshot() if cart.trace_mode else []
 
