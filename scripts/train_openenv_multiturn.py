@@ -36,8 +36,36 @@ _SRC_DIR = _PROJECT_ROOT / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+
+def _load_env_file(path: Path) -> None:
+    """Load .env values before modules read os.environ."""
+    if not path.exists():
+        return
+
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(path, override=False)
+        return
+    except ImportError:
+        pass
+
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file(_PROJECT_ROOT / ".env")
+
 from ecom_rlve.server.openenv import EcomRLVEEnv
-from ecom_rlve.simulator.llm_backend import configure_user_sim_backend
 from ecom_rlve.tools.registry import ToolCall
 from ecom_rlve.training.collections import COLLECTIONS, get_collection
 
@@ -1115,41 +1143,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--user_sim_provider",
-        type=str,
-        default="openai",
-        choices=["openai", "ollama"],
-        help=(
-            "LLM backend for user-simulator prompt/dialogue generation. "
-            "Defaults to openai for training; use ollama only for local testing."
-        ),
-    )
-    parser.add_argument(
-        "--user_sim_model",
-        type=str,
-        default=None,
-        help=(
-            "OpenAI/Azure deployment or model name for user simulation. "
-            "Defaults to AZURE_OPENAI_DEPLOYMENT_NAME, OPENAI_USER_SIM_MODEL, "
-            "OPENAI_DEPLOYMENT_NAME, or OPENAI_MODEL."
-        ),
-    )
-    parser.add_argument(
-        "--user_sim_base_url",
-        type=str,
-        default=None,
-        help=(
-            "Optional OpenAI-compatible base URL for user simulation, e.g. "
-            "an Azure OpenAI /openai/v1 endpoint."
-        ),
-    )
-    parser.add_argument(
-        "--user_sim_timeout",
-        type=int,
-        default=None,
-        help="Optional timeout in seconds for user-simulator LLM calls.",
-    )
-    parser.add_argument(
         "--use_transformers_continuous_batching",
         type=_bool_arg,
         default=None,
@@ -1207,27 +1200,6 @@ def main() -> None:
         os.path.join(args.output_dir, "traces")
         if args.trace_rollouts_dir is None
         else args.trace_rollouts_dir
-    )
-    user_sim_model = (
-        args.user_sim_model
-        or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-        or os.getenv("OPENAI_USER_SIM_MODEL")
-        or os.getenv("OPENAI_DEPLOYMENT_NAME")
-        or os.getenv("OPENAI_MODEL")
-    )
-    user_sim_base_url = (
-        args.user_sim_base_url
-        or os.getenv("AZURE_OPENAI_ENDPOINT")
-        or os.getenv("OPENAI_BASE_URL")
-    )
-    user_sim_api_key = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-
-    configure_user_sim_backend(
-        provider=args.user_sim_provider,
-        model=user_sim_model,
-        base_url=user_sim_base_url,
-        api_key=user_sim_api_key,
-        timeout=args.user_sim_timeout,
     )
 
     _FACTORY_CONFIG.update({
