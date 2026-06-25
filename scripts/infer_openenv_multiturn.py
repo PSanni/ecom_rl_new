@@ -422,7 +422,27 @@ def _load_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any]:
             bnb_4bit_use_double_quant=True,
         )
 
-    tokenizer_source = args.adapter or args.model
+    adapter_source = args.adapter
+    if adapter_source:
+        adapter_path = Path(adapter_source).expanduser()
+        if adapter_path.exists():
+            adapter_source = str(adapter_path.resolve())
+
+    tokenizer_source = args.model
+    if adapter_source:
+        adapter_path = Path(adapter_source)
+        tokenizer_files = {
+            "tokenizer_config.json",
+            "tokenizer.json",
+            "special_tokens_map.json",
+            "vocab.json",
+            "merges.txt",
+            "spiece.model",
+            "sentencepiece.bpe.model",
+        }
+        if adapter_path.exists() and any((adapter_path / name).exists() for name in tokenizer_files):
+            tokenizer_source = str(adapter_path)
+
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -434,10 +454,10 @@ def _load_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any]:
         device_map="auto",
         trust_remote_code=True,
     )
-    if args.adapter:
+    if adapter_source:
         from peft import PeftModel
 
-        model = PeftModel.from_pretrained(model, args.adapter)
+        model = PeftModel.from_pretrained(model, adapter_source)
     model.eval()
     model.config.use_cache = True
     return model, tokenizer
